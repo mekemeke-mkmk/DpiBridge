@@ -12,7 +12,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
-    <Version>0.3.1</Version>
+    <Version>0.3.2</Version>
   </PropertyGroup>
   <ItemGroup>
     <!-- WindowsDesktop SDK を使わずに WinForms を参照（Linux 上の SDK でもビルドできるようにするため） -->

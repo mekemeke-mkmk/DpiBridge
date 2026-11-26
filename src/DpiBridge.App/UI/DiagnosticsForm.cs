@@ -17,9 +17,14 @@ internal sealed class DiagnosticsForm : Form
     private readonly ListView _history = new() { View = View.Details, FullRowSelect = true, Dock = DockStyle.Fill };
     private readonly CheckBox _enabled = new() { Text = "自動補正を有効にする", AutoSize = true };
     private readonly CheckBox _animate = new() { Text = "滑らかに補正（アニメーション）", AutoSize = true };
-    private readonly ComboBox _mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 260 };
+    private readonly ComboBox _mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 240 };
     private readonly System.Windows.Forms.Timer _hoverTimer = new() { Interval = 400 };
+    private readonly SplitContainer _split = new() { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
     private IntPtr _lastHover;
+
+    /// <summary>100% 換算での希望サイズ。実際のサイズはモニターの拡大率と作業領域に合わせて決める。</summary>
+    private static readonly Size PreferredLogicalSize = new(1100, 720);
+    private static readonly int[] HistoryColumnWeights = [8, 14, 22, 14, 14, 28];
 
     private static readonly (SizingMode Mode, string Label)[] Modes =
     [
@@ -32,11 +37,15 @@ internal sealed class DiagnosticsForm : Form
     {
         _app = app;
         _monitors = monitors;
+        SuspendLayout();
         Text = "DpiBridge — 診断と設定";
+        // 100% (96 DPI) で設計し、表示するモニターの拡大率に合わせて WinForms に拡大させる。
+        AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Yu Gothic UI", 9F);
-        Size = new Size(1000, 680);
-        StartPosition = FormStartPosition.CenterScreen;
+        Icon = AppIcon.Create();
+        StartPosition = FormStartPosition.Manual;
+        MinimumSize = new Size(520, 360);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(BuildMonitorTab());
@@ -44,6 +53,8 @@ internal sealed class DiagnosticsForm : Form
         tabs.TabPages.Add(BuildHistoryTab());
         Controls.Add(tabs);
         Controls.Add(BuildSettingsBar());
+        ResumeLayout(false);
+        PerformLayout();
 
         foreach (var rec in history.Reverse()) AddHistory(rec);
         LoadSettingsToUi();
@@ -56,6 +67,50 @@ internal sealed class DiagnosticsForm : Form
             _hoverTimer.Dispose();
             _monitors.Changed -= OnMonitorsChanged;
         };
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        // マウスのあるモニターの中央に、そのモニターに収まる大きさで開く。
+        FitToScreen(Screen.FromPoint(Cursor.Position), center: true);
+        _split.SplitterDistance = Math.Max(_split.Panel1MinSize, _split.Height * 45 / 100);
+        ResizeHistoryColumns();
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        // 別の拡大率のモニターへ移ったら、WinForms の再スケール後にそのモニターからはみ出さないよう収め直す。
+        BeginInvoke(() => FitToScreen(Screen.FromControl(this), center: false));
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        ResizeHistoryColumns();
+    }
+
+    /// <summary>ウィンドウを指定モニターの作業領域に収める。</summary>
+    private void FitToScreen(Screen screen, bool center)
+    {
+        if (WindowState != FormWindowState.Normal) return;
+        var wa = screen.WorkingArea;
+        var preferred = LogicalToDeviceUnits(PreferredLogicalSize);
+        int w = Math.Min(center ? preferred.Width : Width, wa.Width * 92 / 100);
+        int h = Math.Min(center ? preferred.Height : Height, wa.Height * 92 / 100);
+        int x = center ? wa.Left + (wa.Width - w) / 2 : Math.Clamp(Left, wa.Left, wa.Right - w);
+        int y = center ? wa.Top + (wa.Height - h) / 2 : Math.Clamp(Top, wa.Top, wa.Bottom - h);
+        Bounds = new Rectangle(x, y, w, h);
+    }
+
+    private void ResizeHistoryColumns()
+    {
+        if (_history.Columns.Count != HistoryColumnWeights.Length || _history.ClientSize.Width <= 0) return;
+        int total = HistoryColumnWeights.Sum();
+        int width = _history.ClientSize.Width - 4;
+        for (int i = 0; i < HistoryColumnWeights.Length; i++)
+            _history.Columns[i].Width = width * HistoryColumnWeights[i] / total;
     }
 
     private static TextBox MakeReadOnlyText() => new()
@@ -73,44 +128,53 @@ internal sealed class DiagnosticsForm : Form
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
         _grid.RowHeadersVisible = false;
-        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
         _grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
+        _grid.BackgroundColor = SystemColors.Window;
+        // 列は画面幅に合わせて伸縮し、文字は折り返す。見出し・行の高さは文字の大きさに合わせて自動で決める
+        // （固定の高さだと拡大率が高いモニターで文字の上下が切れるため）。
+        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
+        _grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+        _grid.ColumnHeadersDefaultCellStyle.WrapMode = DataGridViewTriState.True;
+        _grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
 
-        void Col(string name, string header, bool editable = false)
+        void Col(string name, string header, float weight, bool editable = false)
         {
-            var c = new DataGridViewTextBoxColumn { Name = name, HeaderText = header, ReadOnly = !editable };
+            var c = new DataGridViewTextBoxColumn
+            {
+                Name = name, HeaderText = header, ReadOnly = !editable, FillWeight = weight, MinimumWidth = 40,
+                SortMode = DataGridViewColumnSortMode.NotSortable,
+            };
             if (editable) c.DefaultCellStyle.BackColor = Color.LightYellow;
             _grid.Columns.Add(c);
         }
-        Col("name", "モニター");
-        Col("kind", "種別");
-        Col("res", "解像度");
-        Col("scale", "拡大率");
-        Col("eff", "実効解像度");
-        Col("edid", "EDID 実寸");
-        Col("src", "見た目の大きさの根拠");
-        Col("diag", "対角インチ（入力）", editable: true);
-        Col("native", "配信先の本来の解像度（入力 例 2880x1920）", editable: true);
-        Col("ppmm", "px/mm");
-        Col("look", "同じウィンドウの見た目（メイン比）");
+        Col("name", "モニター", 16);
+        Col("kind", "種別", 7);
+        Col("res", "解像度", 10);
+        Col("scale", "拡大率", 7);
+        Col("eff", "実効解像度", 10);
+        Col("edid", "EDID 実寸", 14);
+        Col("src", "見た目の大きさの根拠", 14);
+        Col("diag", "対角インチ（入力・任意）", 9, editable: true);
+        Col("native", "本来の解像度（入力・任意 例 2880x1920）", 11, editable: true);
+        Col("ppmm", "px/mm", 7);
+        Col("look", "同じウィンドウの見た目（メイン比）", 9);
 
-        var help = new Label
+        var help = new WrapLabel
         {
-            Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(4),
+            Dock = DockStyle.Top, Padding = new Padding(6),
             Text = "まず下の「見た目キャリブレーション」を実行してください（各モニターに出る枠を実物のカードか定規に合わせるだけ）。" +
                    "仮想ディスプレイ（Surface 側）は実際の見た目の大きさを Windows から取得できないため、これが必要です。" +
                    "Moonlight の引き伸ばしや Windows の拡大率の違いも含めて実測するので、拡大率が同じでも見た目が揃うように補正されます。" +
                    "黄色の欄（対角インチ・本来の解像度）は任意です。",
-            MaximumSize = new Size(960, 0),
         };
 
-        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 230 };
-        split.Panel1.Controls.Add(_grid);
+        _split.Panel1.Controls.Add(_grid);
         var findBox = new GroupBox { Text = "診断結果", Dock = DockStyle.Fill };
         findBox.Controls.Add(_findings);
-        split.Panel2.Controls.Add(findBox);
+        _split.Panel2.Controls.Add(findBox);
 
-        page.Controls.Add(split);
+        page.Controls.Add(_split);
         page.Controls.Add(help);
         return page;
     }
@@ -211,9 +275,9 @@ internal sealed class DiagnosticsForm : Form
     private TabPage BuildWindowTab()
     {
         var page = new TabPage("ウィンドウ診断");
-        var help = new Label
+        var help = new WrapLabel
         {
-            Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(4),
+            Dock = DockStyle.Top, Padding = new Padding(6),
             Text = "調べたいウィンドウ（例: タスクマネージャー）の上にマウスを置くと、そのアプリの DPI 対応状況とぼやけの原因を表示します。",
         };
         page.Controls.Add(_windowInfo);
@@ -270,12 +334,9 @@ internal sealed class DiagnosticsForm : Form
     private TabPage BuildHistoryTab()
     {
         var page = new TabPage("補正履歴");
-        _history.Columns.Add("時刻", 90);
-        _history.Columns.Add("アプリ", 150);
-        _history.Columns.Add("移動", 260);
-        _history.Columns.Add("補正前", 160);
-        _history.Columns.Add("補正後", 160);
-        _history.Columns.Add("結果", 200);
+        // 幅は ResizeHistoryColumns でウィンドウ幅に合わせて配分する。
+        foreach (var name in (string[])["時刻", "アプリ", "移動", "補正前", "補正後", "結果"])
+            _history.Columns.Add(name);
         page.Controls.Add(_history);
         return page;
     }
@@ -298,7 +359,8 @@ internal sealed class DiagnosticsForm : Form
     {
         var bar = new FlowLayoutPanel
         {
-            Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6), WrapContents = true,
+            Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(6), WrapContents = true,
         };
         foreach (var (_, label) in Modes) _mode.Items.Add(label);
 
