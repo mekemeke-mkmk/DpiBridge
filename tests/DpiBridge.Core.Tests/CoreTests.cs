@@ -543,3 +543,59 @@ public class CushionTests
         Assert.False(DragGeometry.NeedsClone(RectI.FromXywh(1800, 100, 400, 300), Low, [Low, twin], 40));
     }
 }
+
+public class PhysicalAlignmentTests
+{
+    // 実際の構成: メイン 1920x1080@100%（4.05px/mm）の下に Surface 2736x1824@200%（10.53px/mm）、x=-386 から
+    private static MonitorGeometry Main => new()
+    {
+        Id = "main", IsPrimary = true, Bounds = new RectI(0, 0, 1920, 1080), WorkArea = new RectI(0, 0, 1920, 1032), Dpi = 96, CalibratedPxPerMm = 4.05,
+    };
+    private static MonitorGeometry Surface => new()
+    {
+        Id = "surface", Bounds = new RectI(-386, 1080, 2350, 2904), WorkArea = new RectI(-386, 1080, 2350, 2856), Dpi = 192, CalibratedPxPerMm = 10.53,
+    };
+    private static readonly MonitorGeometry[] Both = [Main, Surface];
+
+    [Fact]
+    public void CentersAreAlignedByDefault()
+    {
+        var map = DragGeometry.PhysicalMap(Main, Surface, 0, 0)!;
+        var (x, y) = map(Main.Bounds.CenterX, 1080);
+        Assert.Equal(Surface.Bounds.CenterX, x, 3);
+        Assert.Equal(1080, y, 3);
+        // メインで 100px（約24.7mm）右 → Surface で約 260px 右
+        Assert.Equal(Surface.Bounds.CenterX + 100 / 4.05 * 10.53, map(Main.Bounds.CenterX + 100, 1080).X, 3);
+    }
+
+    [Fact]
+    public void Pieces_DoNotDependOnCursorPosition()
+    {
+        var rect = RectI.FromXywh(600, 700, 800, 600); // 下端がメインからはみ出している
+        var a = DragGeometry.Pieces(rect, Main, (700, 1000), Both);
+        var b = DragGeometry.Pieces(rect, Main, (1300, 1000), Both);
+        Assert.Equal(a.Select(p => p.Dest), b.Select(p => p.Dest));
+        var sp = a.Single(p => p.Monitor.Id == "surface");
+        var mp = a.Single(p => p.Monitor.Id == "main");
+        Assert.Equal(1080, mp.Dest.Bottom);
+        Assert.Equal(1080, sp.Dest.Top);
+        Assert.Equal(mp.SrcBottom, sp.SrcTop, 3); // 境目で絵がつながる
+        // 物理的な左端が一致（メイン側の左端の mm 位置 = Surface 側の左端の mm 位置）
+        double mainLeftMm = (mp.Dest.Left - Main.Bounds.CenterX) / 4.05;
+        double surfLeftMm = (sp.Dest.Left - Surface.Bounds.CenterX) / 10.53;
+        Assert.InRange(surfLeftMm - mainLeftMm, -0.2, 0.2);
+    }
+
+    [Fact]
+    public void OffsetShiftsAlongTheEdge()
+    {
+        // Surface が実際には 10mm 右にある → 同じ物理位置は Surface 上で 10mm 左
+        var r = DragGeometry.MapRect(RectI.FromXywh(900, 1000, 100, 100), Main, Surface, 0, 10)!.Value;
+        var r0 = DragGeometry.MapRect(RectI.FromXywh(900, 1000, 100, 100), Main, Surface, 0, 0)!.Value;
+        Assert.InRange(r0.Left - r.Left, 104, 107); // 10mm * 10.53px/mm
+        // 往復で元に戻る
+        var back = DragGeometry.MapRect(r, Surface, Main, 10, 0)!.Value;
+        Assert.InRange(Math.Abs(back.Left - 900), 0, 1);
+        Assert.InRange(Math.Abs(back.Top - 1000), 0, 1);
+    }
+}

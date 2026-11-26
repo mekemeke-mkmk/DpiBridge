@@ -489,6 +489,8 @@ internal sealed class SmoothDragController : IDisposable
             if (_ghostMode) LeaveGhostMode();
             MoveReal(live);
             _liveVisual = live;
+            _rectMonId = _home.Id;
+            _lastRect = live;
             // 見た目が同じモニターへ移った場合は、そこを新しい「いる場所」とする
             if (cursorMon.Id != _home.Id && DragGeometry.Intersect(live, cursorMon.Bounds) is not null
                 && SizingEngine.MonitorFromPoint(monitors, live.CenterX, live.CenterY)?.Id == cursorMon.Id)
@@ -497,9 +499,26 @@ internal sealed class SmoothDragController : IDisposable
         }
 
         if (!_ghostMode) EnterGhostMode();
+        // カーソルが境界を越えた瞬間、Windows の画面配置（ピクセル単位）のせいでカーソルは横に跳ぶ。
+        // ウィンドウはその跳びについていかず、物理的に同じ位置にとどまるよう、つかみ位置を付け替える。
+        if (_rectMonId is not null && _rectMonId != cursorMon.Id
+            && monitors.FirstOrDefault(m => m.Id == _rectMonId) is { } prevMon
+            && DragGeometry.MapRect(_lastRect, prevMon, cursorMon, Off(prevMon), Off(cursorMon)) is { IsEmpty: false } mapped)
+        {
+            _grabFx = (x - mapped.Left) / (double)mapped.Width;
+            _grabFy = (y - mapped.Top) / (double)mapped.Height;
+        }
         var rect = DragGeometry.RectOnCursorMonitor(_widthMm, _heightMm, cursorMon, (x, y), _grabFx, _grabFy);
-        ShowGhosts(DragGeometry.Pieces(rect, cursorMon, (x, y), monitors));
+        _rectMonId = cursorMon.Id;
+        _lastRect = rect;
+        ShowGhosts(DragGeometry.Pieces(rect, cursorMon, (x, y), monitors, Off));
     }
+
+    private string? _rectMonId;
+    private RectI _lastRect;
+
+    /// <summary>モニターの物理的な位置の補正(mm)。</summary>
+    private double Off(MonitorGeometry m) => _settings().AlignOffsetFor(m.Id);
 
     /// <summary>最大化中のウィンドウを元の大きさに戻し、つかんだ位置がカーソルの下に来るよう準備する（Windows 標準と同じ考え方）。</summary>
     private void RestoreForDrag()
@@ -612,7 +631,7 @@ internal sealed class SmoothDragController : IDisposable
         }
 
         // プレビューで最終位置を覆ってから、本物を 1 回で配置する（途中の大きさの変化はプレビューの下に隠れる）。
-        if (_ghostMode) ShowGhosts(DragGeometry.Pieces(target, dest, (x, y), monitors));
+        if (_ghostMode) ShowGhosts(DragGeometry.Pieces(target, dest, (x, y), monitors, Off));
         var pre = DragGeometry.PreCompensate(target, home.Dpi, dest.Dpi);
         var preWindow = _margins.Expand(pre);
         Win32.SetWindowPos(hwnd, IntPtr.Zero, preWindow.Left, preWindow.Top, preWindow.Width, preWindow.Height,
@@ -695,6 +714,7 @@ internal sealed class SmoothDragController : IDisposable
         _home = null;
         _ghostMode = false;
         _restorePending = false;
+        _rectMonId = null;
     }
 
     public void Dispose()

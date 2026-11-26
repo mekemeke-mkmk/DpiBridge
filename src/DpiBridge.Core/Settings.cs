@@ -12,6 +12,11 @@ public sealed class MonitorOverride
     public double? CalibratedPxPerMm { get; set; }
     /// <summary>キャリブレーション時の解像度。解像度が変わったら比例して換算する。</summary>
     public int? CalibratedAtWidth { get; set; }
+    /// <summary>
+    /// 机の上での実際の位置の補正(mm)。隣のモニターとの境目に沿った方向に、このモニターが
+    /// 「中心がそろった位置」からどれだけずれているか（右・下が正）。ドラッグ中の複製を物理的な位置でつなぐのに使う。
+    /// </summary>
+    public double? AlignOffsetMm { get; set; }
     /// <summary>配信先（Surface 等）の本来の解像度。配信解像度の不一致チェックに使う。</summary>
     public int? NativeWidth { get; set; }
     public int? NativeHeight { get; set; }
@@ -50,6 +55,9 @@ public sealed class AppSettings
 
     /// <summary>キー: exe ファイル名（小文字）。</summary>
     public Dictionary<string, SizingMode> AppModes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public double AlignOffsetFor(string monitorId) =>
+        Monitors.TryGetValue(monitorId, out var o) && o.AlignOffsetMm is double v ? v : 0;
 
     public SizingMode ModeFor(string? exeName) =>
         exeName != null && AppModes.TryGetValue(exeName, out var m) ? m : DefaultMode;

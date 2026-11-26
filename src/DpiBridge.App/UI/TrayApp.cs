@@ -70,6 +70,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(smoothItem);
         menu.Items.Add("診断・設定を開く...", null, (_, _) => ShowDiagnostics());
         menu.Items.Add("見た目キャリブレーション...", null, (_, _) => StartCalibration());
+        menu.Items.Add("左右の位置合わせ...", null, (_, _) => StartAlignment());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_updateItem);
         menu.Items.Add(autoInstall);
@@ -259,6 +260,27 @@ internal sealed class TrayApp : ApplicationContext
             ShowDiagnostics();
         });
         _calibration.Show();
+    }
+
+    private AlignmentSession? _alignment;
+
+    public void StartAlignment()
+    {
+        _alignment?.CloseAll();
+        _monitors.Refresh();
+        if (_monitors.Monitors.Count < 2) return;
+        _alignment = new AlignmentSession(_monitors.Monitors, Settings, offsets =>
+        {
+            foreach (var (id, mm) in offsets)
+            {
+                if (!Settings.Monitors.TryGetValue(id, out var o)) Settings.Monitors[id] = o = new MonitorOverride();
+                o.AlignOffsetMm = mm == 0 ? null : mm;
+            }
+            SaveSettings();
+            Log.Info("位置合わせ保存: " + string.Join(", ", offsets.Select(o => $"{o.Key}={o.Value:0.0}mm")));
+            _alignment = null;
+        });
+        _alignment.Show();
     }
 
     private void ShowDiagnostics()

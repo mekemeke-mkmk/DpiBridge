@@ -60,20 +60,56 @@ public static class DragGeometry
         (int)Math.Round(ay + (r.Bottom - ay) * k));
 
     /// <summary>
-    /// カーソルのあるモニター c 上の矩形 rectOnC から、各モニターに表示するゴーストの片を求める。
-    /// c に隣接するモニターには、境目の基準点を中心にそのモニターの密度で拡縮した矩形を使うので、境目で途切れずにつながる。
+    /// モニター from 上の点を、隣り合うモニター to 上の「物理的に同じ位置」の点に写す。
+    /// 境界の辺は共有し（辺に垂直な方向は辺からの距離を mm で保つ）、辺に沿った方向は
+    /// 「両モニターの中心がそろっている」ことを基準に、各モニターの位置補正（offsetMm、右・下が正）でずらす。
+    /// 隣り合っていなければ null。
     /// </summary>
-    public static IReadOnlyList<GhostPiece> Pieces(RectI rectOnC, MonitorGeometry c, (int X, int Y) cursor, IReadOnlyList<MonitorGeometry> monitors)
+    public static Func<double, double, (double X, double Y)>? PhysicalMap(MonitorGeometry from, MonitorGeometry to, double fromOffsetMm, double toOffsetMm)
     {
+        var a = from.Bounds; var b = to.Bounds;
+        double kf = from.PxPerMm, kt = to.PxPerMm;
+        double delta = toOffsetMm - fromOffsetMm; // to が from に対して辺に沿ってずれている量(mm)
+        bool hOverlap = Math.Min(a.Right, b.Right) > Math.Max(a.Left, b.Left);
+        bool vOverlap = Math.Min(a.Bottom, b.Bottom) > Math.Max(a.Top, b.Top);
+        if (hOverlap && (a.Bottom == b.Top || a.Top == b.Bottom))
+        {
+            double edge = a.Bottom == b.Top ? a.Bottom : a.Top;
+            return (x, y) => (to.Bounds.CenterX + ((x - a.CenterX) / kf - delta) * kt, edge + (y - edge) / kf * kt);
+        }
+        if (vOverlap && (a.Right == b.Left || a.Left == b.Right))
+        {
+            double edge = a.Right == b.Left ? a.Right : a.Left;
+            return (x, y) => (edge + (x - edge) / kf * kt, to.Bounds.CenterY + ((y - a.CenterY) / kf - delta) * kt);
+        }
+        return null;
+    }
+
+    /// <summary>矩形を物理的に同じ位置・同じ大きさ(mm)で隣のモニターへ写す。隣り合っていなければ null。</summary>
+    public static RectI? MapRect(RectI r, MonitorGeometry from, MonitorGeometry to, double fromOffsetMm = 0, double toOffsetMm = 0)
+    {
+        if (from.Id == to.Id) return r;
+        var map = PhysicalMap(from, to, fromOffsetMm, toOffsetMm);
+        if (map is null) return null;
+        var (l, t) = map(r.Left, r.Top);
+        var (rr, bb) = map(r.Right, r.Bottom);
+        return new RectI((int)Math.Round(l), (int)Math.Round(t), (int)Math.Round(rr), (int)Math.Round(bb));
+    }
+
+    /// <summary>
+    /// カーソルのあるモニター c 上の矩形 rectOnC から、各モニターに表示するゴーストの片を求める。
+    /// 隣のモニターには、物理的に同じ位置・同じ大きさになるよう写した矩形を使うので、境目で絵が食い違わない
+    /// （Windows の画面配置はピクセル単位なので、カーソルの真下を基準にすると左右がずれる）。
+    /// </summary>
+    public static IReadOnlyList<GhostPiece> Pieces(RectI rectOnC, MonitorGeometry c, (int X, int Y) cursor, IReadOnlyList<MonitorGeometry> monitors,
+        Func<MonitorGeometry, double>? offsetMm = null)
+    {
+        offsetMm ??= _ => 0;
         var list = new List<GhostPiece>();
         foreach (var m in monitors)
         {
-            RectI full;
-            if (m.Id == c.Id) full = rectOnC;
-            else if (SharedEdgeAnchor(c, m, cursor) is var (ax, ay)) full = ScaleAbout(rectOnC, ax, ay, m.PxPerMm / c.PxPerMm);
-            else continue;
-
-            if (Intersect(full, m.Bounds) is not { } piece || full.IsEmpty) continue;
+            if (MapRect(rectOnC, c, m, offsetMm(c), offsetMm(m)) is not { } full || full.IsEmpty) continue;
+            if (Intersect(full, m.Bounds) is not { } piece) continue;
             list.Add(new GhostPiece(m, piece,
                 (piece.Left - full.Left) / (double)full.Width,
                 (piece.Top - full.Top) / (double)full.Height,

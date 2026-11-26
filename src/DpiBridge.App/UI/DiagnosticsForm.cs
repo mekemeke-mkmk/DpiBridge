@@ -266,7 +266,7 @@ internal sealed class DiagnosticsForm : Form
             o.DiagonalInches = diag;
             o.NativeWidth = nw;
             o.NativeHeight = nh;
-            if (o.DiagonalInches is null && o.NativeWidth is null && o.CalibratedPxPerMm is null) settings.Monitors.Remove(id);
+            if (o.DiagonalInches is null && o.NativeWidth is null && o.CalibratedPxPerMm is null && o.AlignOffsetMm is null) settings.Monitors.Remove(id);
         }
         return true;
     }
@@ -368,6 +368,8 @@ internal sealed class DiagnosticsForm : Form
 
         var calib = new Button { Text = "見た目キャリブレーション...", AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
         calib.Click += (_, _) => { _grid.EndEdit(); if (ReadGridIntoSettings()) _app.StartCalibration(); };
+        var align = new Button { Text = "左右の位置合わせ...", AutoSize = true };
+        align.Click += (_, _) => { _grid.EndEdit(); if (ReadGridIntoSettings()) _app.StartAlignment(); };
         var reset = new Button { Text = "キャリブレーションを消去", AutoSize = true };
         reset.Click += (_, _) =>
         {
@@ -382,7 +384,7 @@ internal sealed class DiagnosticsForm : Form
         log.Click += (_, _) => { if (File.Exists(Log.Path)) Process.Start(new ProcessStartInfo(Log.Path) { UseShellExecute = true }); };
 
         bar.Controls.AddRange([
-            calib, reset,
+            calib, align, reset,
             _enabled, _animate,
             new Label { Text = "既定の補正方法:", AutoSize = true, Padding = new Padding(8, 6, 0, 0) },
             _mode,
