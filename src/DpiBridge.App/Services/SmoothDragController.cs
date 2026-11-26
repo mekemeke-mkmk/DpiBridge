@@ -58,6 +58,90 @@ internal sealed class SmoothDragController : IDisposable
         // 手前のウィンドウが Windows 標準の移動中かどうかを 25ms ごとに確認する（軽い処理）。
         _watchTimer.Tick += (_, _) => WatchForegroundMove();
         _watchTimer.Start();
+
+        // アプリが自分でウィンドウを動かす場合（Chrome など）にも気づけるよう、ウィンドウの位置の変化も見る。
+        _locCallback = OnLocationChange;
+        _locHook = Win32.SetWinEventHook(Win32.EVENT_OBJECT_LOCATIONCHANGE, Win32.EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero,
+            _locCallback, 0, 0, Win32.WINEVENT_OUTOFCONTEXT | Win32.WINEVENT_SKIPOWNPROCESS);
+        Log.Info(_locHook == IntPtr.Zero ? "位置変化の通知を受け取れません" : "位置変化の通知の受け取りを開始しました");
+    }
+
+    private readonly Win32.WinEventDelegate _locCallback;
+    private readonly IntPtr _locHook;
+    private IntPtr _traceHwnd;
+    private int _traceCount;
+    private long _traceLast;
+    private IntPtr _appDragDeclined;
+
+    /// <summary>
+    /// ウィンドウの位置が変わったとき（UI スレッド）。マウスのボタンが押されている間だけ見る。
+    /// ・どう動いているかをログに記録する（1 回のドラッグで最大 30 行）。
+    /// ・Windows 標準の移動ならそちらの引き受けへ、アプリが自分で動かしているなら、その移動を止めて引き受ける。
+    /// </summary>
+    private void OnLocationChange(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (idObject != Win32.OBJID_WINDOW || idChild != 0 || hwnd == IntPtr.Zero) return;
+        try
+        {
+            if (!PrimaryButtonDown())
+            {
+                if (_traceHwnd != IntPtr.Zero) { Log.Info($"移動記録: ボタンが離されました（{_traceCount} 回の位置変化）"); _traceHwnd = IntPtr.Zero; }
+                _appDragDeclined = IntPtr.Zero;
+                return;
+            }
+            if (Win32.GetAncestor(hwnd, Win32.GA_ROOT) != hwnd || !Win32.IsWindowVisible(hwnd)) return;
+            if (hwnd == _hwnd || hwnd == _pendingHwnd) return; // 自分が動かしている
+
+            var gti = new Win32.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<Win32.GUITHREADINFO>() };
+            Win32.GetGUIThreadInfo(thread, ref gti);
+            bool inMove = (gti.flags & Win32.GUI_INMOVESIZE) != 0;
+
+            // 記録
+            if (_traceHwnd != hwnd) { _traceHwnd = hwnd; _traceCount = 0; }
+            _traceCount++;
+            long now = Environment.TickCount64;
+            if (_traceCount <= 30 && (now - _traceLast >= 50 || _traceCount == 1))
+            {
+                _traceLast = now;
+                Log.Info($"移動記録#{_traceCount} {WindowInspector.Describe(hwnd)} 矩形={WindowInspector.GetVisualRect(hwnd)} " +
+                         $"最大化={Win32.IsZoomed(hwnd)} Windows標準の移動中={inMove} " +
+                         $"マウスを持っているウィンドウ={(gti.hwndCapture == IntPtr.Zero ? "なし" : WindowInspector.Describe(gti.hwndCapture))}");
+            }
+
+            if (!_active || _hwnd != IntPtr.Zero || _pendingHwnd != IntPtr.Zero) return;
+            if (inMove)
+            {
+                if (hwnd != _seenMoveHwnd) TryTakeOver(hwnd); // 移動開始の通知が届かなかった場合
+                return;
+            }
+            // アプリ自身がマウスをつかんでウィンドウを動かしている（Chrome のタブ・タイトル部分のドラッグなど）
+            if (gti.hwndCapture != IntPtr.Zero && hwnd != _appDragDeclined)
+                TryTakeOverAppDrag(hwnd, gti.hwndCapture, thread);
+        }
+        catch (Exception ex) { Log.Error("位置変化の処理に失敗", ex); }
+    }
+
+    /// <summary>アプリが自分で動かしているウィンドウのドラッグを止めて引き受ける。</summary>
+    private void TryTakeOverAppDrag(IntPtr hwnd, IntPtr capture, uint thread)
+    {
+        _appDragDeclined = hwnd; // 失敗しても同じドラッグ中に何度も試さない
+        string name = WindowInspector.Describe(hwnd);
+        if ((Win32.GetAsyncKeyState(Win32.VK_SHIFT) & 0x8000) != 0) { Decide($"引き受けない: Shift 押下中 {name}"); return; }
+        if (Win32.IsZoomed(hwnd)) return; // 最大化のまま位置だけ変わるのはドラッグではない
+        if (!Win32.GetCursorPos(out var cur)) return;
+        var v = WindowInspector.GetVisualRect(hwnd);
+        if (v.IsEmpty || !v.Contains(cur.X, cur.Y)) return; // カーソルの下にないウィンドウ（つかまれていない）
+        _pendingCursor = (cur.X, cur.Y);
+        _pendingGrab = (Math.Clamp((cur.X - v.Left) / (double)v.Width, 0, 1), Math.Clamp((cur.Y - v.Top) / (double)v.Height, 0, 1));
+
+        if (!Win32.PostMessage(capture, Win32.WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero))
+        { Decide($"引き受けない: アプリの移動を止められない {name}"); return; }
+        Decide($"引き受け開始: アプリ自身の移動を止めています {name}");
+        WaitUntilStopped(hwnd, name, () =>
+        {
+            var g = new Win32.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<Win32.GUITHREADINFO>() };
+            return Win32.GetGUIThreadInfo(thread, ref g) && (g.hwndCapture != IntPtr.Zero || (g.flags & Win32.GUI_INMOVESIZE) != 0);
+        });
     }
 
     private readonly System.Windows.Forms.Timer _watchTimer = new() { Interval = 25 };
@@ -153,6 +237,14 @@ internal sealed class SmoothDragController : IDisposable
         uint thread = Win32.GetWindowThreadProcessId(hwnd, out _);
         if (!Win32.PostMessage(hwnd, Win32.WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero))
         { Decide($"引き受けない: 移動を止められない（管理者権限のアプリ？） {name}"); return false; }
+        Decide($"引き受け開始: Windows の移動を止めています {name}");
+        WaitUntilStopped(hwnd, name, () => InMoveSizeLoop(thread));
+        return true;
+    }
+
+    /// <summary>移動が止まるのを待ってから引き継ぐ。止まらなければ Esc で取り消し、それでも駄目なら諦める。</summary>
+    private void WaitUntilStopped(IntPtr hwnd, string name, Func<bool> stillMoving)
+    {
         _pendingHwnd = hwnd;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         bool escSent = false;
@@ -160,10 +252,9 @@ internal sealed class SmoothDragController : IDisposable
         _pendingTimer.Tick += (_, _) =>
         {
             if (_pendingHwnd != hwnd) { StopPendingTimer(); return; }
-            bool inMove = InMoveSizeLoop(thread);
-            if (!inMove)
+            if (!stillMoving())
             {
-                Decide($"Windows の移動を止めました（{(escSent ? "Esc" : "キャプチャ解除")}、{sw.ElapsedMilliseconds}ms） {name}");
+                Decide($"移動を止めました（{(escSent ? "Esc" : "キャプチャ解除")}、{sw.ElapsedMilliseconds}ms） {name}");
                 OnMoveSizeEnded(hwnd);
                 return;
             }
@@ -177,12 +268,10 @@ internal sealed class SmoothDragController : IDisposable
                 // 止まらなければ諦めて Windows 標準の移動のままにする（理由はログへ）
                 _pendingHwnd = IntPtr.Zero;
                 StopPendingTimer();
-                Decide($"引き受けられませんでした: Windows の移動が止まらない {name}");
+                Decide($"引き受けられませんでした: 移動が止まらない {name}");
             }
         };
         _pendingTimer.Start();
-        Decide($"引き受け開始: Windows の移動を止めています {name}");
-        return true;
     }
 
     private (double X, double Y) _pendingGrab;
@@ -565,6 +654,7 @@ internal sealed class SmoothDragController : IDisposable
         _monitors.Changed -= UpdateActive;
         _polling = false;
         _watchTimer.Dispose();
+        if (_locHook != IntPtr.Zero) Win32.UnhookWinEvent(_locHook);
         StopPendingTimer();
         foreach (var g in _ghosts.Values) g.Dispose();
     }
