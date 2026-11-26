@@ -72,11 +72,9 @@ Windows の仕様（UIPI）で、通常権限のアプリは管理者権限の�
 - 最大化・スナップ配置・サイズ変更不可のウィンドウは補正しません（意図的）。
 
 ## リリースの作り方（開発者向け）
-注釈付きタグを push すると GitHub Actions がテスト・ビルドして Release を作ります（タグのメッセージがリリースノートになります）。
-```bash
-git tag -a v0.3.1 -m "変更点を書く"
-git push origin v0.3.1
-```
+`src/DpiBridge.App/DpiBridge.App.csproj` の `<Version>` を上げ、`CHANGELOG.md` に同じ番号の節を書いて main に push するだけです。
+GitHub Actions（`.github/workflows/release.yml`）がテスト・ビルドして `v{Version}` の Release を作り、
+インストール済みの DpiBridge が自動で検出して更新します。
 
 ## ビルド
 ```bash

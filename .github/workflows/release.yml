@@ -1,13 +1,20 @@
-# v から始まるタグ（例: v0.3.0）を push すると、テスト → exe をビルド → GitHub Release を作成する。
-# アプリはこの Release を見て自動更新する。リリースノートは注釈付きタグのメッセージを使う。
+# main に push されたとき、src/DpiBridge.App/DpiBridge.App.csproj の <Version> に対応する
+# リリース（v{Version}）がまだ無ければ、テスト → exe をビルド → GitHub Release を作成する。
+# つまり「バージョン番号を上げて CHANGELOG.md に変更点を書いて push」するだけでリリースされる。
+# アプリはこの Release を見て自動更新する。
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -15,26 +22,60 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Test
-        run: dotnet test tests/DpiBridge.Core.Tests -c Release
-
-      - name: Publish
-        shell: pwsh
-        run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          dotnet publish src/DpiBridge.App -c Release -r win-x64 --self-contained false `
-            -p:PublishSingleFile=true -p:Version=$v -o publish
-          $h = (Get-FileHash publish/DpiBridge.exe -Algorithm SHA256).Hash.ToLower()
-          [IO.File]::WriteAllText("publish/DpiBridge.exe.sha256", "$h  DpiBridge.exe")
-
-      - name: Create release
+      - name: Read version
+        id: ver
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" publish/DpiBridge.exe publish/DpiBridge.exe.sha256 `
-            --title "DpiBridge ${{ github.ref_name }}" --notes-from-tag
+          [xml]$proj = Get-Content src/DpiBridge.App/DpiBridge.App.csproj
+          $v = ($proj.Project.PropertyGroup | ForEach-Object { $_.Version } | Where-Object { $_ } | Select-Object -First 1).Trim()
+          "version=$v" >> $env:GITHUB_OUTPUT
+          gh release view "v$v" --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT; Write-Host "v$v は既にリリース済み" }
+          else { "exists=false" >> $env:GITHUB_OUTPUT; Write-Host "v$v をリリースします" }
+          exit 0
+
+      - uses: actions/setup-dotnet@v4
+        if: steps.ver.outputs.exists == 'false'
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Test
+        if: steps.ver.outputs.exists == 'false'
+        run: dotnet test tests/DpiBridge.Core.Tests -c Release
+
+      - name: Publish
+        if: steps.ver.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          dotnet publish src/DpiBridge.App -c Release -r win-x64 --self-contained false `
+            -p:PublishSingleFile=true -o publish
+          $h = (Get-FileHash publish/DpiBridge.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("publish/DpiBridge.exe.sha256", "$h  DpiBridge.exe")
+
+      - name: Release notes
+        if: steps.ver.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          # CHANGELOG.md の「## {Version}」の節を取り出す
+          $v = "${{ steps.ver.outputs.version }}"
+          $lines = Get-Content CHANGELOG.md -Encoding utf8
+          $out = @(); $in = $false
+          foreach ($l in $lines) {
+            if ($l -match '^## ') { if ($in) { break }; $in = ($l -match "^## v?$([regex]::Escape($v))(\s|$)"); continue }
+            if ($in) { $out += $l }
+          }
+          if ($out.Count -eq 0) { $out = @("DpiBridge $v") }
+          [IO.File]::WriteAllText("notes.md", ($out -join "`n").Trim(), [Text.UTF8Encoding]::new($false))
+
+      - name: Create release
+        if: steps.ver.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          gh release create "v$v" publish/DpiBridge.exe publish/DpiBridge.exe.sha256 `
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" `
+            --title "DpiBridge $v" --notes-file notes.md
