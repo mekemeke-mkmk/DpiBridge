@@ -17,11 +17,15 @@ internal sealed class TrayApp : ApplicationContext
     private bool _installing;
     private Action? _balloonAction;
     private readonly ToolStripMenuItem _updateItem;
+    private readonly Control _invoker = new();
+    private readonly IDisposable _showListener;
 
     public AppSettings Settings { get; private set; }
 
-    public TrayApp(bool justUpdated = false)
+    public TrayApp(LaunchMode mode = LaunchMode.Manual)
     {
+        bool justUpdated = mode == LaunchMode.Updated;
+        _ = _invoker.Handle; // UI スレッドに処理を戻すためのハンドルを作っておく
         Settings = AppSettings.Load(AppPaths.Settings);
         _monitors = new MonitorService(() => Settings);
         _tracker = new WindowTracker(_monitors, () => Settings);
@@ -66,7 +70,7 @@ internal sealed class TrayApp : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = AppIcon.Create(),
             ContextMenuStrip = menu,
             Visible = true,
         };
@@ -77,7 +81,9 @@ internal sealed class TrayApp : ApplicationContext
 
         // 初回起動時や見た目の大きさが不明なモニターがあるときは診断画面を自動で開いて知らせる。
         var unknown = _monitors.Monitors.Where(m => !m.HasRealScale).ToList();
-        if (!justUpdated && (!File.Exists(AppPaths.Settings) || unknown.Count > 0))
+        bool needsSetup = !File.Exists(AppPaths.Settings) || unknown.Count > 0;
+        // 手動で起動したときは必ず画面を出す（トレイに隠れて「起動しない」ように見えるのを防ぐ）。
+        if (mode == LaunchMode.Manual || (mode == LaunchMode.Startup && needsSetup))
         {
             ShowDiagnostics();
             if (unknown.Count > 0)
@@ -86,7 +92,7 @@ internal sealed class TrayApp : ApplicationContext
                     "拡大率が同じモニター間では補正が働きません。「見た目キャリブレーション」を実行してください。",
                     ToolTipIcon.Warning);
         }
-        else if (justUpdated)
+        if (justUpdated)
             Balloon(null, "DpiBridge を更新しました", $"バージョン {UpdateService.CurrentVersion} になりました。設定はそのまま引き継がれています。", ToolTipIcon.Info);
 
         // 更新確認: 起動 20 秒後に1回、その後は 12 時間ごと。
@@ -98,7 +104,12 @@ internal sealed class TrayApp : ApplicationContext
         };
         _updateTimer.Start();
 
-        Log.Info($"起動 elevated={WindowInspector.SelfElevated} monitors={_monitors.Monitors.Count}");
+        StartupRegistration.Repair();
+
+        // 2つ目の起動（exe をもう一度ダブルクリック等）が来たら画面を前に出す。
+        _showListener = SingleInstance.Listen(() => _invoker.BeginInvoke(ShowDiagnostics));
+
+        Log.Info($"起動 mode={mode} elevated={WindowInspector.SelfElevated} monitors={_monitors.Monitors.Count}");
     }
 
     private static bool SafeStartupEnabled()
@@ -214,6 +225,8 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (_diag is { IsDisposed: false })
         {
+            if (_diag.WindowState == FormWindowState.Minimized) _diag.WindowState = FormWindowState.Normal;
+            _diag.Show();
             _diag.Activate();
             return;
         }
@@ -223,6 +236,7 @@ internal sealed class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        _showListener.Dispose();
         _updateTimer.Dispose();
         _tracker.Dispose();
         _icon.Visible = false;
