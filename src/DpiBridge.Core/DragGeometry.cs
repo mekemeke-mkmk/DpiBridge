@@ -83,6 +83,17 @@ public static class DragGeometry
         return list;
     }
 
+    /// <summary>
+    /// 本物のウィンドウを live の位置に置くと、見た目の違うモニターの「クッション」（境界から cushionMm 以内）に入るか。
+    /// 入るなら、本物は境界をまたがせずにクローンで運ぶ。
+    /// </summary>
+    public static bool NeedsClone(RectI live, MonitorGeometry home, IReadOnlyList<MonitorGeometry> monitors, double cushionMm)
+    {
+        int pad = (int)Math.Round(Math.Max(0, cushionMm) * home.PxPerMm);
+        var probe = new RectI(live.Left - pad, live.Top - pad, live.Right + pad, live.Bottom + pad);
+        return monitors.Any(m => m.Id != home.Id && LooksDifferent(m, home) && Intersect(probe, m.Bounds) is not null);
+    }
+
     /// <summary>r が monitor 以外のモニターに少しでも重なるか。</summary>
     public static bool TouchesOtherMonitor(RectI r, MonitorGeometry monitor, IReadOnlyList<MonitorGeometry> monitors) =>
         monitors.Any(m => m.Id != monitor.Id && Intersect(r, m.Bounds) is not null);

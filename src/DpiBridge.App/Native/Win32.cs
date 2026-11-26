@@ -223,6 +223,35 @@ internal static class Win32
     public static extern bool PhysicalToLogicalPointForPerMonitorDPI(IntPtr hWnd, ref POINT lpPoint);
 
     public const uint WM_CANCELMODE = 0x001F;
+    public const uint GUI_INMOVESIZE = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO
+    {
+        public int cbSize; public uint flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO pgui);
+
+    /// <summary>キーボード入力用の INPUT（x64 の INPUT と同じ 40 バイト）。</summary>
+    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    public struct KEYINPUT
+    {
+        [FieldOffset(0)] public uint type;
+        [FieldOffset(8)] public ushort wVk;
+        [FieldOffset(10)] public ushort wScan;
+        [FieldOffset(12)] public uint dwFlags;
+        [FieldOffset(16)] public uint time;
+        [FieldOffset(24)] public IntPtr dwExtraInfo;
+    }
+    public const uint INPUT_KEYBOARD = 1;
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, KEYINPUT[] pInputs, int cbSize);
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_KEYUP = 0x0101;
     public const int VK_LBUTTON = 0x01;

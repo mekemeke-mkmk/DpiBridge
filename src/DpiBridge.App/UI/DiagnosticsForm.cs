@@ -17,6 +17,7 @@ internal sealed class DiagnosticsForm : Form
     private readonly ListView _history = new() { View = View.Details, FullRowSelect = true, Dock = DockStyle.Fill };
     private readonly CheckBox _enabled = new() { Text = "自動補正を有効にする", AutoSize = true };
     private readonly CheckBox _animate = new() { Text = "滑らかに補正（アニメーション）", AutoSize = true };
+    private readonly NumericUpDown _cushion = new() { Minimum = 0, Maximum = 300, Increment = 5, Width = 70 };
     private readonly ComboBox _mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 240 };
     private readonly System.Windows.Forms.Timer _hoverTimer = new() { Interval = 400 };
     private readonly SplitContainer _split = new() { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
@@ -384,7 +385,9 @@ internal sealed class DiagnosticsForm : Form
             calib, reset,
             _enabled, _animate,
             new Label { Text = "既定の補正方法:", AutoSize = true, Padding = new Padding(8, 6, 0, 0) },
-            _mode, save, refresh, log,
+            _mode,
+            new Label { Text = "境界のクッション(mm):", AutoSize = true, Padding = new Padding(8, 6, 0, 0) },
+            _cushion, save, refresh, log,
         ]);
         return bar;
     }
@@ -395,6 +398,7 @@ internal sealed class DiagnosticsForm : Form
         _enabled.Checked = s.Enabled;
         _animate.Checked = s.Animate;
         _mode.SelectedIndex = Math.Max(0, Array.FindIndex(Modes, m => m.Mode == s.DefaultMode));
+        _cushion.Value = (decimal)Math.Clamp(s.BoundaryCushionMm, 0, 300);
     }
 
     private void Save()
@@ -405,6 +409,7 @@ internal sealed class DiagnosticsForm : Form
         s.Enabled = _enabled.Checked;
         s.Animate = _animate.Checked;
         s.DefaultMode = Modes[Math.Max(0, _mode.SelectedIndex)].Mode;
+        s.BoundaryCushionMm = (double)_cushion.Value;
         _app.SaveSettings(); // → MonitorService.Reapply → FillMonitors
     }
 

@@ -32,6 +32,12 @@ public sealed class AppSettings
     /// </summary>
     public bool SmoothDrag { get; set; } = true;
 
+    /// <summary>
+    /// モニターの境界の「クッション」の幅(mm)。ウィンドウがこの距離まで境界に近づいたら、本物のウィンドウは
+    /// 境界をまたがせず、各モニターにそのモニターの大きさのクローンを表示して運ぶ。
+    /// </summary>
+    public double BoundaryCushionMm { get; set; } = 40;
+
     /// <summary>更新を確認する GitHub リポジトリ（owner/repo）。</summary>
     public string UpdateRepository { get; set; } = "mekemeke-mkmk/DpiBridge";
     /// <summary>起動時と1日ごとに新しいバージョンを確認する。</summary>

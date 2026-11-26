@@ -106,26 +106,66 @@ internal sealed class SmoothDragController : IDisposable
         if (!Win32.GetCursorPos(out var cur)) return false;
         if (IsResizeOperation(hwnd, cur)) { Decide($"引き受けない: サイズ変更の操作 {name}"); return false; }
 
-        // Windows の移動ループを止める（マウスのキャプチャを外させる）。止まると EVENT_SYSTEM_MOVESIZEEND が来る。
+        // つかんだ位置は「移動が始まった時点」のもので覚えておく（止めるまでの間に少し動いても、つかんだ場所がずれないように）。
+        var startVisual = WindowInspector.GetVisualRect(hwnd);
+        if (startVisual.IsEmpty) return false;
+        _pendingGrab = (Math.Clamp((cur.X - startVisual.Left) / (double)startVisual.Width, 0, 1),
+                        Math.Clamp((cur.Y - startVisual.Top) / (double)startVisual.Height, 0, 1));
+
+        // Windows の移動ループを止める。まずマウスのキャプチャを外させ（WM_CANCELMODE）、
+        // それでも移動中のままなら Esc キーで取り消す（ウィンドウは移動開始時の位置に戻るだけなので問題ない）。
+        uint thread = Win32.GetWindowThreadProcessId(hwnd, out _);
         if (!Win32.PostMessage(hwnd, Win32.WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero))
         { Decide($"引き受けない: 移動を止められない（管理者権限のアプリ？） {name}"); return false; }
         _pendingHwnd = hwnd;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        _pendingTimer = new System.Windows.Forms.Timer { Interval = 15 };
+        bool escSent = false;
+        _pendingTimer = new System.Windows.Forms.Timer { Interval = 10 };
         _pendingTimer.Tick += (_, _) =>
         {
             if (_pendingHwnd != hwnd) { StopPendingTimer(); return; }
-            // 止まらなければ諦めて Windows 標準の移動のままにする（理由はログへ）
-            if (sw.ElapsedMilliseconds >= 300)
+            bool inMove = InMoveSizeLoop(thread);
+            if (!inMove)
             {
+                Decide($"Windows の移動を止めました（{(escSent ? "Esc" : "キャプチャ解除")}、{sw.ElapsedMilliseconds}ms） {name}");
+                OnMoveSizeEnded(hwnd);
+                return;
+            }
+            if (!escSent && sw.ElapsedMilliseconds >= 30)
+            {
+                SendEscape(); // 移動中のスレッドがキー入力を受け取るので、移動が取り消される
+                escSent = true;
+            }
+            else if (sw.ElapsedMilliseconds >= 500)
+            {
+                // 止まらなければ諦めて Windows 標準の移動のままにする（理由はログへ）
                 _pendingHwnd = IntPtr.Zero;
                 StopPendingTimer();
                 Decide($"引き受けられませんでした: Windows の移動が止まらない {name}");
             }
         };
         _pendingTimer.Start();
-        Decide($"引き受け: Windows の移動を止めて DpiBridge が移動します {name}");
+        Decide($"引き受け開始: Windows の移動を止めています {name}");
         return true;
+    }
+
+    private (double X, double Y) _pendingGrab;
+
+    /// <summary>そのスレッドが Windows 標準の移動・サイズ変更の最中か。</summary>
+    private static bool InMoveSizeLoop(uint thread)
+    {
+        var gti = new Win32.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<Win32.GUITHREADINFO>() };
+        return Win32.GetGUIThreadInfo(thread, ref gti) && (gti.flags & Win32.GUI_INMOVESIZE) != 0;
+    }
+
+    private static void SendEscape()
+    {
+        var inputs = new[]
+        {
+            new Win32.KEYINPUT { type = Win32.INPUT_KEYBOARD, wVk = Win32.VK_ESCAPE },
+            new Win32.KEYINPUT { type = Win32.INPUT_KEYBOARD, wVk = Win32.VK_ESCAPE, dwFlags = Win32.KEYEVENTF_KEYUP },
+        };
+        Win32.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf<Win32.KEYINPUT>());
     }
 
     private void StopPendingTimer()
@@ -146,7 +186,7 @@ internal sealed class SmoothDragController : IDisposable
             Decide("ボタンが離されていたので移動しません");
             return;
         }
-        Start(hwnd, p.X, p.Y);
+        Start(hwnd, p.X, p.Y, _pendingGrab);
         if (_hwnd != IntPtr.Zero) StartPolling();
     }
 
@@ -201,7 +241,7 @@ internal sealed class SmoothDragController : IDisposable
 
     // ---------------- ドラッグ開始 ----------------
 
-    private void Start(IntPtr hwnd, int x, int y)
+    private void Start(IntPtr hwnd, int x, int y, (double X, double Y) grab)
     {
         try
         {
@@ -216,8 +256,7 @@ internal sealed class SmoothDragController : IDisposable
 
             _widthMm = _liveVisual.Width / _home.PxPerMm;
             _heightMm = _liveVisual.Height / _home.PxPerMm;
-            _grabFx = Math.Clamp((x - _liveVisual.Left) / (double)_liveVisual.Width, 0, 1);
-            _grabFy = Math.Clamp((y - _liveVisual.Top) / (double)_liveVisual.Height, 0, 1);
+            (_grabFx, _grabFy) = grab;
             _resizable = WindowInspector.IsResizableTopLevel(hwnd);
             _ghostMode = false;
         }
@@ -242,10 +281,10 @@ internal sealed class SmoothDragController : IDisposable
             (int)Math.Round(x - _grabFx * _liveVisual.Width), (int)Math.Round(y - _grabFy * _liveVisual.Height),
             _liveVisual.Width, _liveVisual.Height);
 
-        bool canMoveLive = cursorMon.Id == _home.Id
-            ? !monitors.Any(m => m.Id != _home.Id && DragGeometry.LooksDifferent(m, _home) && DragGeometry.Intersect(live, m.Bounds) is not null)
-            : !DragGeometry.LooksDifferent(cursorMon, _home)
-              && !monitors.Any(m => m.Id != _home.Id && DragGeometry.LooksDifferent(m, _home) && DragGeometry.Intersect(live, m.Bounds) is not null);
+        // 見た目の違うモニターの境界から「クッション」の幅以内に近づいたら、本物は動かさずクローンで運ぶ。
+        double cushion = _settings().BoundaryCushionMm;
+        bool canMoveLive = (cursorMon.Id == _home.Id || !DragGeometry.LooksDifferent(cursorMon, _home))
+            && !DragGeometry.NeedsClone(live, _home, monitors, cushion);
 
         if (canMoveLive)
         {

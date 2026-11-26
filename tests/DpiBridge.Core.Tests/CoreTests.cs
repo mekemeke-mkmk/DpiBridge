@@ -513,3 +513,33 @@ public class DragGeometryTests
         Assert.Equal(0, r.Top);
     }
 }
+
+public class CushionTests
+{
+    private static MonitorGeometry Low => new()
+    {
+        Id = "low", Bounds = new RectI(0, 0, 1920, 1080), WorkArea = new RectI(0, 0, 1920, 1032), Dpi = 96, CalibratedPxPerMm = 4,
+    };
+    private static MonitorGeometry High => new()
+    {
+        Id = "high", Bounds = new RectI(1920, 0, 4656, 1824), WorkArea = new RectI(1920, 0, 4656, 1776), Dpi = 192, CalibratedPxPerMm = 10,
+    };
+    private static readonly MonitorGeometry[] Both = [Low, High];
+
+    [Fact]
+    public void CloneStartsBeforeTouchingTheBoundary()
+    {
+        // 右端が境界まで 100px（= 25mm）手前
+        var live = RectI.FromXywh(1020, 100, 800, 600);
+        Assert.False(DragGeometry.NeedsClone(live, Low, Both, cushionMm: 0));
+        Assert.False(DragGeometry.NeedsClone(live, Low, Both, cushionMm: 20));
+        Assert.True(DragGeometry.NeedsClone(live, Low, Both, cushionMm: 40));
+    }
+
+    [Fact]
+    public void SameLookingMonitorsNeverNeedClone()
+    {
+        var twin = Low with { Id = "twin", Bounds = new RectI(1920, 0, 3840, 1080) };
+        Assert.False(DragGeometry.NeedsClone(RectI.FromXywh(1800, 100, 400, 300), Low, [Low, twin], 40));
+    }
+}
