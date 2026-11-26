@@ -35,6 +35,7 @@ internal sealed class SmoothDragController : IDisposable
     private int _latestX, _latestY;
 
     public event Action<CorrectionRecord>? Moved;
+    private bool _activeLogged;
 
     public SmoothDragController(MonitorService monitors, Func<AppSettings> settings, Control invoker)
     {
@@ -68,7 +69,13 @@ internal sealed class SmoothDragController : IDisposable
         var mons = _monitors.Monitors;
         bool differs = mons.Any(a => mons.Any(b => a.Id != b.Id && DragGeometry.LooksDifferent(a, b)));
         var s = _settings();
-        _hook.Active = s.Enabled && s.SmoothDrag && differs;
+        bool active = s.Enabled && s.SmoothDrag && differs;
+        if (active != _hook.Active || !_activeLogged)
+        {
+            _activeLogged = true;
+            Log.Info($"なめらかドラッグ: {(active ? "有効" : "無効")} (自動補正={s.Enabled}, なめらかドラッグ設定={s.SmoothDrag}, 見た目の違うモニター={differs}, モニター数={mons.Count})");
+        }
+        _hook.Active = active;
     }
 
     // ---------------- ドラッグ開始 ----------------

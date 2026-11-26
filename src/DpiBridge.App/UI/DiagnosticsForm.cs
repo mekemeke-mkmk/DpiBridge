@@ -323,6 +323,7 @@ internal sealed class DiagnosticsForm : Form
             $"見た目の矩形    : {w.VisualRect}",
             $"補正対象        : {(WindowInspector.IsResizableTopLevel(h) ? "はい" : "いいえ（最大化・スナップ・サイズ固定など）")} / モード {mode}",
             $"DpiBridge 権限  : {(WindowInspector.SelfElevated ? "管理者" : "通常")}",
+            $"直近のドラッグ判定: {MouseDragHook.LastDecision}",
             "",
             "■ 診断",
             .. findings.Select(f => $"[{SeverityLabel(f.Severity)}] {f.Message}"),
