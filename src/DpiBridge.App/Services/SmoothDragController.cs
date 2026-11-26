@@ -22,6 +22,7 @@ internal sealed class SmoothDragController : IDisposable
     private readonly MonitorService _monitors;
     private readonly Func<AppSettings> _settings;
     private readonly Control _invoker;
+    private readonly MouseDragHook _hook = new();
     private volatile bool _active;
     private volatile bool _polling;
     private IntPtr _pendingHwnd;           // Windows の移動を止めるのを待っているウィンドウ
@@ -51,6 +52,19 @@ internal sealed class SmoothDragController : IDisposable
         _monitors = monitors;
         _settings = settings;
         _invoker = invoker;
+        // 主な検知: マウスのボタンが押された場所がタイトルバーなら、その時点でドラッグを引き受ける。
+        // （0.4.1 のログで、Sunshine 経由のクリックでも Chrome のタイトルバーを検知できていたことを確認済み）
+        _hook.DragStarted += (h, x, y) => Post(() => StartFromHook(h, x, y));
+        _hook.DragMoved += (x, y) =>
+        {
+            Interlocked.Exchange(ref _latestX, x);
+            Interlocked.Exchange(ref _latestY, y);
+            if (Interlocked.Exchange(ref _movePending, 1) == 0)
+                Post(() => { Interlocked.Exchange(ref _movePending, 0); Move(Volatile.Read(ref _latestX), Volatile.Read(ref _latestY)); });
+        };
+        _hook.DragEnded += (x, y) => Post(() => End(x, y));
+        _hook.ClickReleased += () => Post(MouseDragHook.ReplayClick);
+
         _monitors.Changed += UpdateActive;
         UpdateActive();
 
@@ -190,6 +204,40 @@ internal sealed class SmoothDragController : IDisposable
             Log.Info($"なめらかドラッグ: {(active ? "有効" : "無効")} (自動補正={s.Enabled}, なめらかドラッグ設定={s.SmoothDrag}, 見た目の違うモニター={differs}, モニター数={mons.Count})");
         }
         _active = active;
+        _hook.Active = active;
+    }
+
+    /// <summary>タイトルバーのドラッグを、押した時点から引き受ける（マウスフック経由）。</summary>
+    private void StartFromHook(IntPtr hwnd, int x, int y)
+    {
+        if (_hwnd != IntPtr.Zero || _pendingHwnd != IntPtr.Zero) { _hook.Reset(); return; }
+        Activate(hwnd); // 押下を止めたので、標準のドラッグと同じく前面にする
+        var v = WindowInspector.GetVisualRect(hwnd);
+        if (v.IsEmpty) { _hook.Reset(); return; }
+        _pendingCursor = (x, y);
+        _seenMoveHwnd = hwnd;
+        Decide($"引き受け: タイトルバーのドラッグ（最大化={Win32.IsZoomed(hwnd)}） {WindowInspector.Describe(hwnd)}");
+        Start(hwnd, x, y, (Math.Clamp((x - v.Left) / (double)v.Width, 0, 1), Math.Clamp((y - v.Top) / (double)v.Height, 0, 1)));
+        if (_hwnd == IntPtr.Zero) _hook.Reset();
+    }
+
+    /// <summary>クリックを止めたのでウィンドウが前面に来ていない。標準のドラッグと同じく前面にする。</summary>
+    private static void Activate(IntPtr hwnd)
+    {
+        var fg = Win32.GetForegroundWindow();
+        if (fg == hwnd) return;
+        uint fgThread = Win32.GetWindowThreadProcessId(fg, out _);
+        uint me = Win32.GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && Win32.AttachThreadInput(me, fgThread, true);
+        try
+        {
+            Win32.SetForegroundWindow(hwnd);
+            Win32.BringWindowToTop(hwnd);
+        }
+        finally
+        {
+            if (attached) Win32.AttachThreadInput(me, fgThread, false);
+        }
     }
 
     private static void Decide(string message)
@@ -653,6 +701,7 @@ internal sealed class SmoothDragController : IDisposable
     {
         _monitors.Changed -= UpdateActive;
         _polling = false;
+        _hook.Dispose();
         _watchTimer.Dispose();
         if (_locHook != IntPtr.Zero) Win32.UnhookWinEvent(_locHook);
         StopPendingTimer();
