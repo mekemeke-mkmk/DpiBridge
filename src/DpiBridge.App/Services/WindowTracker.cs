@@ -20,6 +20,12 @@ internal sealed class WindowTracker : IDisposable
 
     public event Action<CorrectionRecord>? Corrected;
 
+    /// <summary>移動・サイズ変更の開始時に呼ばれる。true を返したら、そのドラッグは呼び出し先が引き受けたので補正しない。</summary>
+    public Func<IntPtr, bool>? TakeOver;
+
+    /// <summary>移動・サイズ変更の終了時に呼ばれる（引き受けたドラッグで Windows 標準の移動が止まったかの確認用）。</summary>
+    public Action<IntPtr>? MoveSizeEnded;
+
     public WindowTracker(MonitorService monitors, Func<AppSettings> settings)
     {
         _monitors = monitors;
@@ -35,8 +41,16 @@ internal sealed class WindowTracker : IDisposable
         if (idObject != Win32.OBJID_WINDOW || hwnd == IntPtr.Zero) return;
         try
         {
-            if (ev == Win32.EVENT_SYSTEM_MOVESIZESTART) OnStart(hwnd);
-            else if (ev == Win32.EVENT_SYSTEM_MOVESIZEEND) OnEnd(hwnd);
+            if (ev == Win32.EVENT_SYSTEM_MOVESIZESTART)
+            {
+                if (TakeOver?.Invoke(hwnd) == true) { _starts.Remove(hwnd); return; }
+                OnStart(hwnd);
+            }
+            else if (ev == Win32.EVENT_SYSTEM_MOVESIZEEND)
+            {
+                MoveSizeEnded?.Invoke(hwnd);
+                OnEnd(hwnd);
+            }
         }
         catch (Exception ex) { Log.Error("WinEvent 処理中のエラー", ex); }
     }

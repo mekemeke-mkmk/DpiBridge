@@ -137,6 +137,26 @@ internal static class WindowInspector
         };
     }
 
+    /// <summary>WM_NCHITTEST の結果。応答なし・権限不足は -999。</summary>
+    public static long HitTest(IntPtr hwnd, POINT pt)
+    {
+        // 相手の DPI 認識に合わせた座標で判定する（DPI 非対応アプリは論理座標で判定するため）。
+        var p = pt;
+        try { Win32.PhysicalToLogicalPointForPerMonitorDPI(hwnd, ref p); } catch (EntryPointNotFoundException) { }
+        var lParam = (IntPtr)(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF));
+        return Win32.SendMessageTimeout(hwnd, Win32.WM_NCHITTEST, IntPtr.Zero, lParam, Win32.SMTO_ABORTIFHUNG, 50, out var hit) == IntPtr.Zero
+            ? -999 : (short)hit.ToInt64();
+    }
+
+    /// <summary>ログ用の短い説明 [exe / クラス名]。</summary>
+    public static string Describe(IntPtr hwnd)
+    {
+        Win32.GetWindowThreadProcessId(hwnd, out uint pid);
+        var cls = new StringBuilder(128);
+        Win32.GetClassName(hwnd, cls, cls.Capacity);
+        return $"[{Path.GetFileName(GetExePath(pid) ?? "?")} / {cls}]";
+    }
+
     public static IntPtr RootWindowUnderCursor()
     {
         if (!Win32.GetCursorPos(out var p)) return IntPtr.Zero;

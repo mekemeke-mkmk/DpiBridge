@@ -5,8 +5,11 @@ using DpiBridge.Core;
 namespace DpiBridge.App.Services;
 
 /// <summary>
-/// タイトルバーのドラッグを DpiBridge が代わりに行い、モニター間の移動を自然に見せる。
+/// ウィンドウのドラッグ移動を DpiBridge が代わりに行い、モニター間の移動を自然に見せる。
 ///
+/// ・Windows がウィンドウの移動を始めた瞬間（EVENT_SYSTEM_MOVESIZESTART）に、その移動を止めて（WM_CANCELMODE）引き受ける。
+///   タイトルバーの作りはアプリごとに違うが、この方法ならどのアプリでも同じように働く。
+/// ・引き受けた後は、画面の更新に合わせてカーソル位置とボタンの状態を読み取る（マウスフック不要。Sunshine 経由の操作でも動く）。
 /// ・同じモニター内では本物のウィンドウをそのまま動かす（見た目は Windows 標準と同じ）。
 /// ・見た目の違うモニターにかかりそうになったら、本物のウィンドウは元のモニター側の画面外に退避させ
 ///   （DPI が切り替わらないので、途中で大きさが変わったり一部だけ拡大されたりしない）、
@@ -18,8 +21,14 @@ internal sealed class SmoothDragController : IDisposable
 {
     private readonly MonitorService _monitors;
     private readonly Func<AppSettings> _settings;
-    private readonly MouseDragHook _hook = new();
     private readonly Control _invoker;
+    private volatile bool _active;
+    private volatile bool _polling;
+    private IntPtr _pendingHwnd;           // Windows の移動を止めるのを待っているウィンドウ
+    private System.Windows.Forms.Timer? _pendingTimer;
+
+    /// <summary>直近のドラッグの判定（診断画面とログ用）。</summary>
+    public static volatile string LastDecision = "まだドラッグがありません";
     private readonly Dictionary<string, GhostWindow> _ghosts = new();
 
     // ドラッグ中の状態
@@ -42,17 +51,6 @@ internal sealed class SmoothDragController : IDisposable
         _monitors = monitors;
         _settings = settings;
         _invoker = invoker;
-        _hook.DragStarted += (h, x, y) => Post(() => Start(h, x, y));
-        _hook.DragMoved += (x, y) =>
-        {
-            // マウス移動は大量に来るので、最新の位置だけを UI スレッドで処理する。
-            Interlocked.Exchange(ref _latestX, x);
-            Interlocked.Exchange(ref _latestY, y);
-            if (Interlocked.Exchange(ref _movePending, 1) == 0)
-                Post(() => { Interlocked.Exchange(ref _movePending, 0); Move(Volatile.Read(ref _latestX), Volatile.Read(ref _latestY)); });
-        };
-        _hook.DragEnded += (x, y) => Post(() => End(x, y));
-        _hook.ClickReleased += () => Post(MouseDragHook.ReplayClick);
         _monitors.Changed += UpdateActive;
         UpdateActive();
     }
@@ -70,12 +68,135 @@ internal sealed class SmoothDragController : IDisposable
         bool differs = mons.Any(a => mons.Any(b => a.Id != b.Id && DragGeometry.LooksDifferent(a, b)));
         var s = _settings();
         bool active = s.Enabled && s.SmoothDrag && differs;
-        if (active != _hook.Active || !_activeLogged)
+        if (active != _active || !_activeLogged)
         {
             _activeLogged = true;
             Log.Info($"なめらかドラッグ: {(active ? "有効" : "無効")} (自動補正={s.Enabled}, なめらかドラッグ設定={s.SmoothDrag}, 見た目の違うモニター={differs}, モニター数={mons.Count})");
         }
-        _hook.Active = active;
+        _active = active;
+    }
+
+    private static void Decide(string message)
+    {
+        LastDecision = $"{DateTime.Now:HH:mm:ss} {message}";
+        Log.Info("ドラッグ判定: " + message);
+    }
+
+    private static bool PrimaryButtonDown()
+    {
+        int vk = Win32.GetSystemMetrics(Win32.SM_SWAPBUTTON) != 0 ? Win32.VK_RBUTTON : Win32.VK_LBUTTON;
+        return (Win32.GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+
+    // ---------------- Windows の移動を引き受ける ----------------
+
+    /// <summary>
+    /// Windows がウィンドウの移動・サイズ変更を始めたときに呼ばれる（UI スレッド）。引き受けたら true。
+    /// </summary>
+    public bool TryTakeOver(IntPtr hwnd)
+    {
+        string name = WindowInspector.Describe(hwnd);
+        if (!_active) { Decide($"引き受けない: なめらかドラッグが無効 {name}"); return false; }
+        if (_hwnd != IntPtr.Zero || _pendingHwnd != IntPtr.Zero) return false;
+        if ((Win32.GetAsyncKeyState(Win32.VK_SHIFT) & 0x8000) != 0) { Decide($"引き受けない: Shift 押下中 → Windows 標準 {name}"); return false; }
+        if (!PrimaryButtonDown()) { Decide($"引き受けない: マウスのボタンが押されていない（キーボードでの移動など） {name}"); return false; }
+        if (Win32.IsZoomed(hwnd)) { Decide($"引き受けない: 最大化中 → Windows 標準 {name}"); return false; }
+        if (WindowInspector.WhyNotResizable(hwnd) is { } why && why != "サイズ変更できないウィンドウ")
+        { Decide($"引き受けない: {why} → Windows 標準 {name}"); return false; }
+        if (!Win32.GetCursorPos(out var cur)) return false;
+        if (IsResizeOperation(hwnd, cur)) { Decide($"引き受けない: サイズ変更の操作 {name}"); return false; }
+
+        // Windows の移動ループを止める（マウスのキャプチャを外させる）。止まると EVENT_SYSTEM_MOVESIZEEND が来る。
+        if (!Win32.PostMessage(hwnd, Win32.WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero))
+        { Decide($"引き受けない: 移動を止められない（管理者権限のアプリ？） {name}"); return false; }
+        _pendingHwnd = hwnd;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _pendingTimer = new System.Windows.Forms.Timer { Interval = 15 };
+        _pendingTimer.Tick += (_, _) =>
+        {
+            if (_pendingHwnd != hwnd) { StopPendingTimer(); return; }
+            // 止まらなければ諦めて Windows 標準の移動のままにする（理由はログへ）
+            if (sw.ElapsedMilliseconds >= 300)
+            {
+                _pendingHwnd = IntPtr.Zero;
+                StopPendingTimer();
+                Decide($"引き受けられませんでした: Windows の移動が止まらない {name}");
+            }
+        };
+        _pendingTimer.Start();
+        Decide($"引き受け: Windows の移動を止めて DpiBridge が移動します {name}");
+        return true;
+    }
+
+    private void StopPendingTimer()
+    {
+        _pendingTimer?.Stop();
+        _pendingTimer?.Dispose();
+        _pendingTimer = null;
+    }
+
+    /// <summary>Windows の移動が終わった（＝止まった）ときに呼ばれる（UI スレッド）。</summary>
+    public void OnMoveSizeEnded(IntPtr hwnd)
+    {
+        if (hwnd != _pendingHwnd) return;
+        _pendingHwnd = IntPtr.Zero;
+        StopPendingTimer();
+        if (!PrimaryButtonDown() || !Win32.GetCursorPos(out var p))
+        {
+            Decide("ボタンが離されていたので移動しません");
+            return;
+        }
+        Start(hwnd, p.X, p.Y);
+        if (_hwnd != IntPtr.Zero) StartPolling();
+    }
+
+    /// <summary>カーソル位置がサイズ変更の枠の上か（そうでなければ移動とみなす）。</summary>
+    private static bool IsResizeOperation(IntPtr hwnd, POINT cur)
+    {
+        long hit = WindowInspector.HitTest(hwnd, cur);
+        if (hit >= Win32.HTLEFT && hit <= Win32.HTBOTTOMRIGHT) return true;
+        if (hit != -999) return false;
+        // 判定できないときは位置で推測: 見た目の枠の外側や縁の近くならサイズ変更
+        var v = WindowInspector.GetVisualRect(hwnd);
+        const int edge = 6;
+        return cur.X < v.Left + edge || cur.X >= v.Right - edge || cur.Y < v.Top + 3 || cur.Y >= v.Bottom - edge;
+    }
+
+    /// <summary>画面の更新ごとにカーソルとボタンを読み、UI スレッドへ渡す。</summary>
+    private void StartPolling()
+    {
+        _polling = true;
+        var t = new Thread(() =>
+        {
+            int lastX = int.MinValue, lastY = int.MinValue;
+            try
+            {
+                while (_polling)
+                {
+                    if (Win32.DwmFlush() != 0) Thread.Sleep(8); // 画面の更新タイミングに合わせる
+                    if (!Win32.GetCursorPos(out var p)) continue;
+                    if (!PrimaryButtonDown())
+                    {
+                        _polling = false;
+                        Post(() => End(p.X, p.Y));
+                        break;
+                    }
+                    if (p.X == lastX && p.Y == lastY) continue;
+                    (lastX, lastY) = (p.X, p.Y);
+                    Interlocked.Exchange(ref _latestX, p.X);
+                    Interlocked.Exchange(ref _latestY, p.Y);
+                    if (Interlocked.Exchange(ref _movePending, 1) == 0)
+                        Post(() => { Interlocked.Exchange(ref _movePending, 0); Move(Volatile.Read(ref _latestX), Volatile.Read(ref _latestY)); });
+                }
+            }
+            catch (Exception ex)
+            {
+                _polling = false;
+                Log.Error("ドラッグ中の読み取りに失敗", ex);
+                Post(Abort);
+            }
+        }) { IsBackground = true, Name = "DpiBridge.DragPoll" };
+        t.Start();
     }
 
     // ---------------- ドラッグ開始 ----------------
@@ -84,8 +205,7 @@ internal sealed class SmoothDragController : IDisposable
     {
         try
         {
-            if (!Win32.IsWindow(hwnd)) { _hook.Reset(); return; }
-            Activate(hwnd);
+            if (!Win32.IsWindow(hwnd)) return;
 
             _hwnd = hwnd;
             _startWindowRect = WindowInspector.GetWindowRect(hwnd);
@@ -105,25 +225,6 @@ internal sealed class SmoothDragController : IDisposable
         {
             Log.Error("ドラッグ開始の処理に失敗", ex);
             Abort();
-        }
-    }
-
-    /// <summary>クリックを止めたのでウィンドウが前面に来ていない。標準のドラッグと同じく前面にする。</summary>
-    private static void Activate(IntPtr hwnd)
-    {
-        var fg = Win32.GetForegroundWindow();
-        if (fg == hwnd) return;
-        uint fgThread = Win32.GetWindowThreadProcessId(fg, out _);
-        uint me = Win32.GetCurrentThreadId();
-        bool attached = fgThread != 0 && fgThread != me && Win32.AttachThreadInput(me, fgThread, true);
-        try
-        {
-            Win32.SetForegroundWindow(hwnd);
-            Win32.BringWindowToTop(hwnd);
-        }
-        finally
-        {
-            if (attached) Win32.AttachThreadInput(me, fgThread, false);
         }
     }
 
@@ -318,18 +419,18 @@ internal sealed class SmoothDragController : IDisposable
         // 元の位置・大きさに戻す
         var r = _startWindowRect;
         Win32.SetWindowPos(_hwnd, IntPtr.Zero, r.Left, r.Top, r.Width, r.Height, Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
-        _hook.Reset();
+        Decide("Esc で取り消しました");
         Finish();
     }
 
     private void Abort()
     {
-        _hook.Reset();
         Finish();
     }
 
     private void Finish(bool keepGhosts = false)
     {
+        _polling = false;
         if (!keepGhosts) HideGhosts();
         _hwnd = IntPtr.Zero;
         _home = null;
@@ -339,7 +440,8 @@ internal sealed class SmoothDragController : IDisposable
     public void Dispose()
     {
         _monitors.Changed -= UpdateActive;
-        _hook.Dispose();
+        _polling = false;
+        StopPendingTimer();
         foreach (var g in _ghosts.Values) g.Dispose();
     }
 }

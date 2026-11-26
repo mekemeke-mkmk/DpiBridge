@@ -222,6 +222,17 @@ internal static class Win32
     [DllImport("user32.dll")]
     public static extern bool PhysicalToLogicalPointForPerMonitorDPI(IntPtr hWnd, ref POINT lpPoint);
 
+    public const uint WM_CANCELMODE = 0x001F;
+    public const uint WM_KEYDOWN = 0x0100;
+    public const uint WM_KEYUP = 0x0101;
+    public const int VK_LBUTTON = 0x01;
+    public const int VK_RBUTTON = 0x02;
+    public const int SM_SWAPBUTTON = 23;
+    public const int HTLEFT = 10, HTBOTTOMRIGHT = 17;
+
+    [DllImport("user32.dll")]
+    public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
     public const int SM_CXDRAG = 68;
     public const int SM_CYDRAG = 69;
 

@@ -38,13 +38,15 @@ internal sealed class TrayApp : ApplicationContext
         };
 
         _smoothDrag = new SmoothDragController(_monitors, () => Settings, _invoker);
+        _tracker.TakeOver = _smoothDrag.TryTakeOver;
+        _tracker.MoveSizeEnded = _smoothDrag.OnMoveSizeEnded;
         _smoothDrag.Moved += rec =>
         {
             _history.Insert(0, rec);
             if (_history.Count > 100) _history.RemoveAt(_history.Count - 1);
             _diag?.AddHistory(rec);
         };
-        var smoothItem = new ToolStripMenuItem("モニター間をなめらかにドラッグ（Shift+ドラッグで標準動作）")
+        var smoothItem = new ToolStripMenuItem("モニター間をなめらかに移動（Shift+ドラッグで標準動作）")
         { Checked = Settings.SmoothDrag, CheckOnClick = true };
         smoothItem.CheckedChanged += (_, _) => { Settings.SmoothDrag = smoothItem.Checked; SaveSettings(); };
 
@@ -73,6 +75,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(autoInstall);
         menu.Items.Add(startup);
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("診断情報をコピー（問い合わせ用）", null, (_, _) => CopyDiagnostics());
         menu.Items.Add("設定フォルダーを開く", null, (_, _) =>
         {
             Directory.CreateDirectory(AppPaths.Folder);
@@ -196,6 +199,29 @@ internal sealed class TrayApp : ApplicationContext
             MessageBox.Show($"更新できませんでした（今のバージョンのまま動作します）。\n{ex.Message}", "DpiBridge",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    private void CopyDiagnostics()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"DpiBridge {UpdateService.CurrentVersion} / 管理者権限={WindowInspector.SelfElevated} / OS={Environment.OSVersion.Version}");
+        sb.AppendLine($"自動補正={Settings.Enabled} なめらか移動={Settings.SmoothDrag} 既定モード={Settings.DefaultMode}");
+        foreach (var m in _monitors.Monitors)
+            sb.AppendLine($"モニター {m.FriendlyName}{(m.IsPrimary ? "(メイン)" : "")}: {m.Bounds} 拡大率{m.ScalePercent:0}% {m.PxPerMm:0.00}px/mm 根拠={m.Source} 仮想={m.IsVirtual}");
+        sb.AppendLine($"直近のドラッグ判定: {SmoothDragController.LastDecision}");
+        sb.AppendLine("--- ログ（最後の 40 行）---");
+        try
+        {
+            if (File.Exists(Log.Path))
+                foreach (var line in File.ReadLines(Log.Path).TakeLast(40)) sb.AppendLine(line);
+        }
+        catch (Exception ex) { sb.AppendLine("ログを読めませんでした: " + ex.Message); }
+        try
+        {
+            Clipboard.SetText(sb.ToString());
+            Balloon(null, "診断情報をコピーしました", "チャットなどに貼り付けて送ってください。", ToolTipIcon.Info);
+        }
+        catch (Exception ex) { Log.Error("クリップボードへのコピーに失敗", ex); }
     }
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + "…";
