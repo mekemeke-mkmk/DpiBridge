@@ -33,14 +33,17 @@ internal sealed class WindowTracker : IDisposable
         _callback = OnWinEvent;
         _hook = Win32.SetWinEventHook(Win32.EVENT_SYSTEM_MOVESIZESTART, Win32.EVENT_SYSTEM_MOVESIZEEND,
             IntPtr.Zero, _callback, 0, 0, Win32.WINEVENT_OUTOFCONTEXT | Win32.WINEVENT_SKIPOWNPROCESS);
-        if (_hook == IntPtr.Zero) Log.Info("SetWinEventHook に失敗しました");
+        Log.Info(_hook == IntPtr.Zero ? "SetWinEventHook に失敗しました" : "Windows の移動通知の受け取りを開始しました");
     }
 
     private void OnWinEvent(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
     {
-        if (idObject != Win32.OBJID_WINDOW || hwnd == IntPtr.Zero) return;
         try
         {
+            // 原因調査のため、Windows からの「移動開始・終了」の通知はすべて記録する（1回のドラッグで2行だけ）。
+            Log.Info($"Windows通知: {(ev == Win32.EVENT_SYSTEM_MOVESIZESTART ? "移動開始" : "移動終了")} obj={idObject} " +
+                     $"{WindowInspector.Describe(hwnd)} 最大化={Win32.IsZoomed(hwnd)}");
+            if (idObject != Win32.OBJID_WINDOW || hwnd == IntPtr.Zero) return;
             if (ev == Win32.EVENT_SYSTEM_MOVESIZESTART)
             {
                 if (TakeOver?.Invoke(hwnd) == true) { _starts.Remove(hwnd); return; }

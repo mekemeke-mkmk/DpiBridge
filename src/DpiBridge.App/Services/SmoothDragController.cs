@@ -53,6 +53,38 @@ internal sealed class SmoothDragController : IDisposable
         _invoker = invoker;
         _monitors.Changed += UpdateActive;
         UpdateActive();
+
+        // 予備の検知: Windows からの移動開始の通知が届かない環境でも動くよう、
+        // 手前のウィンドウが Windows 標準の移動中かどうかを 25ms ごとに確認する（軽い処理）。
+        _watchTimer.Tick += (_, _) => WatchForegroundMove();
+        _watchTimer.Start();
+    }
+
+    private readonly System.Windows.Forms.Timer _watchTimer = new() { Interval = 25 };
+    private IntPtr _seenMoveHwnd;   // 今の移動ループについて判定済みのウィンドウ（同じ移動で何度も判定しない）
+
+    private void WatchForegroundMove()
+    {
+        try
+        {
+            if (!_active) return;
+            var fg = Win32.GetForegroundWindow();
+            if (fg == IntPtr.Zero) return;
+            uint thread = Win32.GetWindowThreadProcessId(fg, out uint pid);
+            if (pid == Environment.ProcessId) return;
+            var gti = new Win32.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<Win32.GUITHREADINFO>() };
+            if (!Win32.GetGUIThreadInfo(thread, ref gti) || (gti.flags & Win32.GUI_INMOVESIZE) == 0)
+            {
+                _seenMoveHwnd = IntPtr.Zero; // 移動が終わった
+                return;
+            }
+            var hwnd = gti.hwndMoveSize != IntPtr.Zero ? gti.hwndMoveSize : fg;
+            if (hwnd == _seenMoveHwnd || hwnd == _pendingHwnd || hwnd == _hwnd) return;
+            _seenMoveHwnd = hwnd;
+            Log.Info($"Windows 標準の移動を検知（予備の検知） {WindowInspector.Describe(hwnd)}");
+            TryTakeOver(hwnd);
+        }
+        catch (Exception ex) { Log.Error("移動の検知に失敗", ex); }
     }
 
     private void Post(Action a)
@@ -95,16 +127,20 @@ internal sealed class SmoothDragController : IDisposable
     /// </summary>
     public bool TryTakeOver(IntPtr hwnd)
     {
+        if (hwnd == _pendingHwnd || hwnd == _hwnd) return true; // 既に引き受け中（通知と予備の検知の両方から来た）
+        _seenMoveHwnd = hwnd;
         string name = WindowInspector.Describe(hwnd);
         if (!_active) { Decide($"引き受けない: なめらかドラッグが無効 {name}"); return false; }
         if (_hwnd != IntPtr.Zero || _pendingHwnd != IntPtr.Zero) return false;
         if ((Win32.GetAsyncKeyState(Win32.VK_SHIFT) & 0x8000) != 0) { Decide($"引き受けない: Shift 押下中 → Windows 標準 {name}"); return false; }
         if (!PrimaryButtonDown()) { Decide($"引き受けない: マウスのボタンが押されていない（キーボードでの移動など） {name}"); return false; }
-        if (Win32.IsZoomed(hwnd)) { Decide($"引き受けない: 最大化中 → Windows 標準 {name}"); return false; }
-        if (WindowInspector.WhyNotResizable(hwnd) is { } why && why != "サイズ変更できないウィンドウ")
+        // 最大化中のウィンドウも引き受ける（ドラッグし始めたら DpiBridge が元の大きさに戻して運ぶ）。
+        bool zoomed = Win32.IsZoomed(hwnd);
+        if (!zoomed && WindowInspector.WhyNotResizable(hwnd) is { } why && why != "サイズ変更できないウィンドウ")
         { Decide($"引き受けない: {why} → Windows 標準 {name}"); return false; }
         if (!Win32.GetCursorPos(out var cur)) return false;
-        if (IsResizeOperation(hwnd, cur)) { Decide($"引き受けない: サイズ変更の操作 {name}"); return false; }
+        if (!zoomed && IsResizeOperation(hwnd, cur)) { Decide($"引き受けない: サイズ変更の操作 {name}"); return false; }
+        _pendingCursor = (cur.X, cur.Y);
 
         // つかんだ位置は「移動が始まった時点」のもので覚えておく（止めるまでの間に少し動いても、つかんだ場所がずれないように）。
         var startVisual = WindowInspector.GetVisualRect(hwnd);
@@ -150,6 +186,12 @@ internal sealed class SmoothDragController : IDisposable
     }
 
     private (double X, double Y) _pendingGrab;
+    private (int X, int Y) _pendingCursor;
+
+    // 最大化中のウィンドウのドラッグ: 実際に動かし始めるまでは元に戻さない（クリックだけなら何もしない）
+    private bool _restorePending;
+    private RectI _maxVisual;
+    private (int X, int Y) _downPt;
 
     /// <summary>そのスレッドが Windows 標準の移動・サイズ変更の最中か。</summary>
     private static bool InMoveSizeLoop(uint thread)
@@ -246,6 +288,18 @@ internal sealed class SmoothDragController : IDisposable
         try
         {
             if (!Win32.IsWindow(hwnd)) return;
+            if (Win32.IsZoomed(hwnd))
+            {
+                _hwnd = hwnd;
+                _restorePending = true;
+                _maxVisual = WindowInspector.GetVisualRect(hwnd);
+                _downPt = _pendingCursor;
+                _home = SizingEngine.MonitorFromPoint(_monitors.Monitors, _maxVisual.CenterX, _maxVisual.CenterY);
+                _ghostMode = false;
+                if (_home is null || _maxVisual.IsEmpty) Abort();
+                return;
+            }
+            _restorePending = false;
 
             _hwnd = hwnd;
             _startWindowRect = WindowInspector.GetWindowRect(hwnd);
@@ -272,6 +326,13 @@ internal sealed class SmoothDragController : IDisposable
     private void Move(int x, int y)
     {
         if (_hwnd == IntPtr.Zero || _home is null) return;
+        if (_restorePending)
+        {
+            int dx = Math.Max(4, Win32.GetSystemMetrics(Win32.SM_CXDRAG)), dy = Math.Max(4, Win32.GetSystemMetrics(Win32.SM_CYDRAG));
+            if (Math.Abs(x - _downPt.X) < dx && Math.Abs(y - _downPt.Y) < dy) return; // まだクリックの範囲
+            RestoreForDrag();
+            if (_hwnd == IntPtr.Zero) return;
+        }
         if ((Win32.GetAsyncKeyState(Win32.VK_ESCAPE) & 0x8000) != 0) { Cancel(); return; }
         var monitors = _monitors.Monitors;
         var cursorMon = SizingEngine.MonitorFromPoint(monitors, x, y) ?? _home;
@@ -301,6 +362,27 @@ internal sealed class SmoothDragController : IDisposable
         if (!_ghostMode) EnterGhostMode();
         var rect = DragGeometry.RectOnCursorMonitor(_widthMm, _heightMm, cursorMon, (x, y), _grabFx, _grabFy);
         ShowGhosts(DragGeometry.Pieces(rect, cursorMon, (x, y), monitors));
+    }
+
+    /// <summary>最大化中のウィンドウを元の大きさに戻し、つかんだ位置がカーソルの下に来るよう準備する（Windows 標準と同じ考え方）。</summary>
+    private void RestoreForDrag()
+    {
+        _restorePending = false;
+        var hwnd = _hwnd;
+        double fx = Math.Clamp((_downPt.X - _maxVisual.Left) / (double)Math.Max(1, _maxVisual.Width), 0, 1);
+        int offY = Math.Max(0, _downPt.Y - _maxVisual.Top);
+        Win32.ShowWindow(hwnd, Win32.SW_RESTORE);
+        _startWindowRect = WindowInspector.GetWindowRect(hwnd);
+        _liveVisual = WindowInspector.GetVisualRect(hwnd);
+        _margins = FrameMargins.Between(_startWindowRect, _liveVisual);
+        _home = SizingEngine.MonitorFromPoint(_monitors.Monitors, _liveVisual.CenterX, _liveVisual.CenterY);
+        if (_home is null || _liveVisual.IsEmpty || Win32.IsZoomed(hwnd)) { Decide("最大化を解除できませんでした"); Abort(); return; }
+        _widthMm = _liveVisual.Width / _home.PxPerMm;
+        _heightMm = _liveVisual.Height / _home.PxPerMm;
+        _grabFx = fx;
+        _grabFy = Math.Clamp(Math.Min(offY, _liveVisual.Height / 2) / (double)_liveVisual.Height, 0, 1);
+        _resizable = WindowInspector.IsResizableTopLevel(hwnd);
+        Decide($"最大化を解除して移動します {WindowInspector.Describe(hwnd)}");
     }
 
     private void MoveReal(RectI visual)
@@ -366,6 +448,7 @@ internal sealed class SmoothDragController : IDisposable
     private void End(int x, int y)
     {
         if (_hwnd == IntPtr.Zero || _home is null) return;
+        if (_restorePending) { Finish(); return; } // 最大化したまま動かさずに離した（クリックだけ）
         Move(x, y);
         if (_hwnd == IntPtr.Zero) return; // Esc で取り消された
         var monitors = _monitors.Monitors;
@@ -474,12 +557,14 @@ internal sealed class SmoothDragController : IDisposable
         _hwnd = IntPtr.Zero;
         _home = null;
         _ghostMode = false;
+        _restorePending = false;
     }
 
     public void Dispose()
     {
         _monitors.Changed -= UpdateActive;
         _polling = false;
+        _watchTimer.Dispose();
         StopPendingTimer();
         foreach (var g in _ghosts.Values) g.Dispose();
     }

@@ -301,6 +301,7 @@ internal static class Win32
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
     public const int SW_MAXIMIZE = 3;
+    public const int SW_RESTORE = 9;
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
