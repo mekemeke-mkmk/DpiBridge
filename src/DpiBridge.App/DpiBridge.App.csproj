@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>DpiBridge</AssemblyName>
+    <RootNamespace>DpiBridge.App</RootNamespace>
+    <!-- 自分自身は Per-Monitor v2 で動き、物理ピクセル座標で他のウィンドウを扱う -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <Version>0.3.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- WindowsDesktop SDK を使わずに WinForms を参照（Linux 上の SDK でもビルドできるようにするため） -->
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
+    <Using Include="System.Windows.Forms" />
+    <Using Include="System.Drawing" />
+    <ProjectReference Include="..\DpiBridge.Core\DpiBridge.Core.csproj" />
+  </ItemGroup>
+</Project>
