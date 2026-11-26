@@ -19,6 +19,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _updateItem;
     private readonly Control _invoker = new();
     private readonly IDisposable _showListener;
+    private readonly SmoothDragController _smoothDrag;
 
     public AppSettings Settings { get; private set; }
 
@@ -35,6 +36,17 @@ internal sealed class TrayApp : ApplicationContext
             if (_history.Count > 100) _history.RemoveAt(_history.Count - 1);
             _diag?.AddHistory(rec);
         };
+
+        _smoothDrag = new SmoothDragController(_monitors, () => Settings, _invoker);
+        _smoothDrag.Moved += rec =>
+        {
+            _history.Insert(0, rec);
+            if (_history.Count > 100) _history.RemoveAt(_history.Count - 1);
+            _diag?.AddHistory(rec);
+        };
+        var smoothItem = new ToolStripMenuItem("モニター間をなめらかにドラッグ（Shift+ドラッグで標準動作）")
+        { Checked = Settings.SmoothDrag, CheckOnClick = true };
+        smoothItem.CheckedChanged += (_, _) => { Settings.SmoothDrag = smoothItem.Checked; SaveSettings(); };
 
         _enabledItem = new ToolStripMenuItem("自動補正を有効にする") { Checked = Settings.Enabled, CheckOnClick = true };
         _enabledItem.CheckedChanged += (_, _) => { Settings.Enabled = _enabledItem.Checked; SaveSettings(); UpdateTooltip(); };
@@ -53,6 +65,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(new ToolStripMenuItem($"DpiBridge {UpdateService.CurrentVersion}") { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_enabledItem);
+        menu.Items.Add(smoothItem);
         menu.Items.Add("診断・設定を開く...", null, (_, _) => ShowDiagnostics());
         menu.Items.Add("見た目キャリブレーション...", null, (_, _) => StartCalibration());
         menu.Items.Add(new ToolStripSeparator());
@@ -195,6 +208,7 @@ internal sealed class TrayApp : ApplicationContext
         try { Settings.Save(AppPaths.Settings); }
         catch (Exception ex) { Log.Error("設定の保存に失敗", ex); }
         _monitors.Reapply();
+        _smoothDrag?.UpdateActive();
         if (_enabledItem.Checked != Settings.Enabled) _enabledItem.Checked = Settings.Enabled;
     }
 
@@ -237,6 +251,7 @@ internal sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _showListener.Dispose();
+        _smoothDrag.Dispose();
         _updateTimer.Dispose();
         _tracker.Dispose();
         _icon.Visible = false;

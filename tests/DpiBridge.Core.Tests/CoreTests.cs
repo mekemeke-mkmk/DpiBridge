@@ -388,3 +388,128 @@ public class UpdateCheckTests
         Assert.Null(UpdateCheck.ParseSha256File("xyz"));
     }
 }
+
+public class DragGeometryTests
+{
+    // 左: 1920x1080 @100%（4 px/mm）、右: 2736x1824 @200%（10 px/mm）。境目は x = 1920。
+    private static MonitorGeometry Low => new()
+    {
+        Id = "low", FriendlyName = "Low", IsPrimary = true,
+        Bounds = new RectI(0, 0, 1920, 1080), WorkArea = new RectI(0, 0, 1920, 1032), Dpi = 96, CalibratedPxPerMm = 4,
+    };
+    private static MonitorGeometry High => new()
+    {
+        Id = "high", FriendlyName = "High",
+        Bounds = new RectI(1920, 0, 1920 + 2736, 1824), WorkArea = new RectI(1920, 0, 1920 + 2736, 1776), Dpi = 192, CalibratedPxPerMm = 10,
+    };
+    private static readonly MonitorGeometry[] Both = [Low, High];
+
+    [Fact]
+    public void RectKeepsMillimetersAndGrabPoint()
+    {
+        var r = DragGeometry.RectOnCursorMonitor(200, 100, High, (3000, 500), 0.25, 0.05);
+        Assert.Equal(2000, r.Width);
+        Assert.Equal(1000, r.Height);
+        Assert.Equal(3000 - 500, r.Left);
+        Assert.Equal(500 - 50, r.Top);
+    }
+
+    [Fact]
+    public void SharedEdgeAnchor_ProjectsCursorOntoBoundary()
+    {
+        Assert.Equal((1920.0, 300.0), DragGeometry.SharedEdgeAnchor(Low, High, (1800, 300)));
+        Assert.Equal((1920.0, 1080.0), DragGeometry.SharedEdgeAnchor(Low, High, (1800, 1500)));
+        var far = High with { Id = "far", Bounds = new RectI(5000, 0, 6000, 1000) };
+        Assert.Null(DragGeometry.SharedEdgeAnchor(Low, far, (1800, 300)));
+    }
+
+    [Fact]
+    public void Pieces_AreContinuousAtTheBoundary_AndUseEachMonitorsDensity()
+    {
+        // カーソルは左（低密度）モニター、ウィンドウは 200x100mm で右モニターへはみ出している
+        var cursor = (1800, 300);
+        var onLow = DragGeometry.RectOnCursorMonitor(200, 100, Low, cursor, 0.5, 0.1); // 800x400px, x=1400..2200
+        var pieces = DragGeometry.Pieces(onLow, Low, cursor, Both);
+        Assert.Equal(2, pieces.Count);
+
+        var low = pieces.Single(p => p.Monitor.Id == "low");
+        var high = pieces.Single(p => p.Monitor.Id == "high");
+        Assert.Equal(1920, low.Dest.Right);
+        Assert.Equal(1920, high.Dest.Left);
+        // 元ウィンドウのどこを映すかが境目で一致する（途切れない）
+        Assert.Equal(low.SrcRight, high.SrcLeft, 3);
+        // 右側は 10/4 倍の密度で描かれる → 同じ割合の幅でもピクセル数は 2.5 倍
+        double lowPxPerFraction = low.Dest.Width / (low.SrcRight - low.SrcLeft);
+        double highPxPerFraction = high.Dest.Width / (high.SrcRight - high.SrcLeft);
+        Assert.Equal(2.5, highPxPerFraction / lowPxPerFraction, 2);
+        // 低密度側の片はウィンドウ本来の大きさ（拡大されていない）
+        Assert.Equal(400, low.Dest.Height);
+        Assert.InRange(high.Dest.Height, 999, 1001);
+    }
+
+    [Fact]
+    public void Pieces_SingleMonitorWhenFullyInside()
+    {
+        var cursor = (3000, 600);
+        var r = DragGeometry.RectOnCursorMonitor(100, 50, High, cursor, 0.5, 0.1);
+        var pieces = DragGeometry.Pieces(r, High, cursor, Both);
+        Assert.Single(pieces);
+        Assert.Equal((0.0, 0.0, 1.0, 1.0), (pieces[0].SrcLeft, pieces[0].SrcTop, pieces[0].SrcRight, pieces[0].SrcBottom));
+    }
+
+    [Fact]
+    public void TouchesOtherMonitor()
+    {
+        Assert.False(DragGeometry.TouchesOtherMonitor(RectI.FromXywh(100, 100, 800, 600), Low, Both));
+        Assert.True(DragGeometry.TouchesOtherMonitor(RectI.FromXywh(1500, 100, 800, 600), Low, Both));
+        Assert.False(DragGeometry.TouchesOtherMonitor(RectI.FromXywh(-300, 100, 800, 600), Low, Both)); // 画面外へのはみ出しは OK
+    }
+
+    [Fact]
+    public void LooksDifferent()
+    {
+        Assert.True(DragGeometry.LooksDifferent(Low, High));
+        Assert.False(DragGeometry.LooksDifferent(Low, Low with { Id = "low2" }));
+        Assert.True(DragGeometry.LooksDifferent(Low, Low with { Id = "low3", CalibratedPxPerMm = 6 })); // 同じ拡大率でも密度が違えば
+    }
+
+    [Fact]
+    public void ParkingSpot_IsOffscreenAndNearestToHome()
+    {
+        var w = RectI.FromXywh(1200, 200, 600, 400);
+        var spot = DragGeometry.ParkingSpot(w, Low, Both)!.Value;
+        Assert.DoesNotContain(Both, m => DragGeometry.Intersect(spot, m.Bounds) is not null);
+        Assert.True(spot.Right <= 0 || spot.Top >= 1080 || spot.Bottom <= 0, spot.ToString()); // 左・下・上のどれか（右は High がある）
+        Assert.Equal(600, spot.Width);
+
+        var spotHigh = DragGeometry.ParkingSpot(RectI.FromXywh(2500, 200, 600, 400), High, Both)!.Value;
+        Assert.True(spotHigh.Left >= High.Bounds.Right || spotHigh.Top >= High.Bounds.Bottom || spotHigh.Bottom <= 0, spotHigh.ToString());
+    }
+
+    [Fact]
+    public void PreCompensate_ScalesByDpiRatio()
+    {
+        var t = RectI.FromXywh(2000, 100, 1000, 600);
+        Assert.Equal(RectI.FromXywh(2000, 100, 500, 300), DragGeometry.PreCompensate(t, 96, 192));
+        Assert.Equal(t, DragGeometry.PreCompensate(t, 144, 144));
+    }
+
+    [Fact]
+    public void Snap_OnlyOnOuterEdges()
+    {
+        Assert.Equal(SnapZone.Maximize, DragGeometry.DetectSnap((500, 0), Low, Both));
+        Assert.Equal(SnapZone.LeftHalf, DragGeometry.DetectSnap((0, 500), Low, Both));
+        Assert.Equal(SnapZone.None, DragGeometry.DetectSnap((1919, 500), Low, Both)); // 右隣にモニターがある
+        Assert.Equal(SnapZone.RightHalf, DragGeometry.DetectSnap((High.Bounds.Right - 1, 500), High, Both));
+        Assert.Equal(new RectI(1920, 0, 1920 + 1368, 1776), DragGeometry.SnapRect(SnapZone.LeftHalf, High.WorkArea));
+    }
+
+    [Fact]
+    public void FitInto_ShrinksAndClamps()
+    {
+        var r = DragGeometry.FitInto(RectI.FromXywh(1800, -50, 3000, 600), High.WorkArea);
+        Assert.Equal(2736, r.Width);
+        Assert.Equal(High.WorkArea.Left, r.Left);
+        Assert.Equal(0, r.Top);
+    }
+}

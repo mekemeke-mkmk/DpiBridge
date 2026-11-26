@@ -26,6 +26,12 @@ public sealed class AppSettings
     /// <summary>移動終了から補正開始までの待ち時間。アプリ自身の DPI 再レイアウトを待つ。</summary>
     public int SettleDelayMs { get; set; } = 60;
 
+    /// <summary>
+    /// タイトルバーのドラッグを DpiBridge が行い、見た目の違うモニター間をなめらかに移動させる
+    /// （途中で大きさが変わったり一部だけ拡大されたりしない）。Shift を押しながらのドラッグは Windows 標準。
+    /// </summary>
+    public bool SmoothDrag { get; set; } = true;
+
     /// <summary>更新を確認する GitHub リポジトリ（owner/repo）。</summary>
     public string UpdateRepository { get; set; } = "mekemeke-mkmk/DpiBridge";
     /// <summary>起動時と1日ごとに新しいバージョンを確認する。</summary>

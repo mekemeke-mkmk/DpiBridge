@@ -1,0 +1,338 @@
+using DpiBridge.App.Native;
+using DpiBridge.App.UI;
+using DpiBridge.Core;
+
+namespace DpiBridge.App.Services;
+
+/// <summary>
+/// タイトルバーのドラッグを DpiBridge が代わりに行い、モニター間の移動を自然に見せる。
+///
+/// ・同じモニター内では本物のウィンドウをそのまま動かす（見た目は Windows 標準と同じ）。
+/// ・見た目の違うモニターにかかりそうになったら、本物のウィンドウは元のモニター側の画面外に退避させ
+///   （DPI が切り替わらないので、途中で大きさが変わったり一部だけ拡大されたりしない）、
+///   代わりに各モニターの密度で描いたプレビューを境目でつなげて表示する。
+/// ・離したら、移動先で最終的な大きさになるよう 1 回で配置し、プレビューで覆っている間に整えてから消す。
+/// UI スレッドで生成・操作すること。
+/// </summary>
+internal sealed class SmoothDragController : IDisposable
+{
+    private readonly MonitorService _monitors;
+    private readonly Func<AppSettings> _settings;
+    private readonly MouseDragHook _hook = new();
+    private readonly Control _invoker;
+    private readonly Dictionary<string, GhostWindow> _ghosts = new();
+
+    // ドラッグ中の状態
+    private IntPtr _hwnd;
+    private MonitorGeometry? _home;        // 本物のウィンドウがいるモニター（退避中も DPI はこのモニターのまま）
+    private RectI _liveVisual;              // 本物のウィンドウの見た目の矩形（退避前の最後の位置）
+    private FrameMargins _margins;
+    private double _widthMm, _heightMm, _grabFx, _grabFy;
+    private bool _resizable;
+    private bool _ghostMode;
+    private RectI _startWindowRect;
+    private int _movePending;
+    private int _latestX, _latestY;
+
+    public event Action<CorrectionRecord>? Moved;
+
+    public SmoothDragController(MonitorService monitors, Func<AppSettings> settings, Control invoker)
+    {
+        _monitors = monitors;
+        _settings = settings;
+        _invoker = invoker;
+        _hook.DragStarted += (h, x, y) => Post(() => Start(h, x, y));
+        _hook.DragMoved += (x, y) =>
+        {
+            // マウス移動は大量に来るので、最新の位置だけを UI スレッドで処理する。
+            Interlocked.Exchange(ref _latestX, x);
+            Interlocked.Exchange(ref _latestY, y);
+            if (Interlocked.Exchange(ref _movePending, 1) == 0)
+                Post(() => { Interlocked.Exchange(ref _movePending, 0); Move(Volatile.Read(ref _latestX), Volatile.Read(ref _latestY)); });
+        };
+        _hook.DragEnded += (x, y) => Post(() => End(x, y));
+        _hook.ClickReleased += () => Post(MouseDragHook.ReplayClick);
+        _monitors.Changed += UpdateActive;
+        UpdateActive();
+    }
+
+    private void Post(Action a)
+    {
+        try { if (!_invoker.IsDisposed) _invoker.BeginInvoke(a); }
+        catch (Exception ex) { Log.Error("UI スレッドへの受け渡しに失敗", ex); }
+    }
+
+    /// <summary>設定やモニター構成が変わったら、横取りするかどうかを更新する。</summary>
+    public void UpdateActive()
+    {
+        var mons = _monitors.Monitors;
+        bool differs = mons.Any(a => mons.Any(b => a.Id != b.Id && DragGeometry.LooksDifferent(a, b)));
+        var s = _settings();
+        _hook.Active = s.Enabled && s.SmoothDrag && differs;
+    }
+
+    // ---------------- ドラッグ開始 ----------------
+
+    private void Start(IntPtr hwnd, int x, int y)
+    {
+        try
+        {
+            if (!Win32.IsWindow(hwnd)) { _hook.Reset(); return; }
+            Activate(hwnd);
+
+            _hwnd = hwnd;
+            _startWindowRect = WindowInspector.GetWindowRect(hwnd);
+            _liveVisual = WindowInspector.GetVisualRect(hwnd);
+            _margins = FrameMargins.Between(_startWindowRect, _liveVisual);
+            _home = SizingEngine.MonitorFromPoint(_monitors.Monitors, _liveVisual.CenterX, _liveVisual.CenterY);
+            if (_home is null || _liveVisual.IsEmpty) { Abort(); return; }
+
+            _widthMm = _liveVisual.Width / _home.PxPerMm;
+            _heightMm = _liveVisual.Height / _home.PxPerMm;
+            _grabFx = Math.Clamp((x - _liveVisual.Left) / (double)_liveVisual.Width, 0, 1);
+            _grabFy = Math.Clamp((y - _liveVisual.Top) / (double)_liveVisual.Height, 0, 1);
+            _resizable = WindowInspector.IsResizableTopLevel(hwnd);
+            _ghostMode = false;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("ドラッグ開始の処理に失敗", ex);
+            Abort();
+        }
+    }
+
+    /// <summary>クリックを止めたのでウィンドウが前面に来ていない。標準のドラッグと同じく前面にする。</summary>
+    private static void Activate(IntPtr hwnd)
+    {
+        var fg = Win32.GetForegroundWindow();
+        if (fg == hwnd) return;
+        uint fgThread = Win32.GetWindowThreadProcessId(fg, out _);
+        uint me = Win32.GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && Win32.AttachThreadInput(me, fgThread, true);
+        try
+        {
+            Win32.SetForegroundWindow(hwnd);
+            Win32.BringWindowToTop(hwnd);
+        }
+        finally
+        {
+            if (attached) Win32.AttachThreadInput(me, fgThread, false);
+        }
+    }
+
+    // ---------------- ドラッグ中 ----------------
+
+    private void Move(int x, int y)
+    {
+        if (_hwnd == IntPtr.Zero || _home is null) return;
+        if ((Win32.GetAsyncKeyState(Win32.VK_ESCAPE) & 0x8000) != 0) { Cancel(); return; }
+        var monitors = _monitors.Monitors;
+        var cursorMon = SizingEngine.MonitorFromPoint(monitors, x, y) ?? _home;
+
+        // 本物のウィンドウをそのまま動かした場合の位置（大きさは今のまま）
+        var live = RectI.FromXywh(
+            (int)Math.Round(x - _grabFx * _liveVisual.Width), (int)Math.Round(y - _grabFy * _liveVisual.Height),
+            _liveVisual.Width, _liveVisual.Height);
+
+        bool canMoveLive = cursorMon.Id == _home.Id
+            ? !monitors.Any(m => m.Id != _home.Id && DragGeometry.LooksDifferent(m, _home) && DragGeometry.Intersect(live, m.Bounds) is not null)
+            : !DragGeometry.LooksDifferent(cursorMon, _home)
+              && !monitors.Any(m => m.Id != _home.Id && DragGeometry.LooksDifferent(m, _home) && DragGeometry.Intersect(live, m.Bounds) is not null);
+
+        if (canMoveLive)
+        {
+            if (_ghostMode) LeaveGhostMode();
+            MoveReal(live);
+            _liveVisual = live;
+            // 見た目が同じモニターへ移った場合は、そこを新しい「いる場所」とする
+            if (cursorMon.Id != _home.Id && DragGeometry.Intersect(live, cursorMon.Bounds) is not null
+                && SizingEngine.MonitorFromPoint(monitors, live.CenterX, live.CenterY)?.Id == cursorMon.Id)
+                _home = cursorMon;
+            return;
+        }
+
+        if (!_ghostMode) EnterGhostMode();
+        var rect = DragGeometry.RectOnCursorMonitor(_widthMm, _heightMm, cursorMon, (x, y), _grabFx, _grabFy);
+        ShowGhosts(DragGeometry.Pieces(rect, cursorMon, (x, y), monitors));
+    }
+
+    private void MoveReal(RectI visual)
+    {
+        var r = _margins.Expand(visual);
+        Win32.SetWindowPos(_hwnd, IntPtr.Zero, r.Left, r.Top, 0, 0,
+            Win32.SWP_NOSIZE | Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | Win32.SWP_ASYNCWINDOWPOS);
+    }
+
+    private void EnterGhostMode()
+    {
+        _ghostMode = true;
+        // 本物のウィンドウは「いる場所」のモニターに最も近い画面外へ退避（DPI が変わらない）。
+        var spot = DragGeometry.ParkingSpot(_margins.Expand(_liveVisual), _home!, _monitors.Monitors);
+        if (spot is { } s)
+        {
+            Win32.SetWindowPos(_hwnd, IntPtr.Zero, s.Left, s.Top, 0, 0,
+                Win32.SWP_NOSIZE | Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | Win32.SWP_ASYNCWINDOWPOS);
+        }
+    }
+
+    private void LeaveGhostMode()
+    {
+        _ghostMode = false;
+        HideGhosts();
+    }
+
+    private void ShowGhosts(IReadOnlyList<GhostPiece> pieces)
+    {
+        var used = new HashSet<string>();
+        foreach (var p in pieces)
+        {
+            if (!_ghosts.TryGetValue(p.Monitor.Id, out var g) || g.IsDisposed)
+                _ghosts[p.Monitor.Id] = g = new GhostWindow();
+            if (!g.Attach(_hwnd)) continue;
+            g.Present(p.Dest, SourceRect(g, p));
+            used.Add(p.Monitor.Id);
+        }
+        foreach (var (id, g) in _ghosts)
+            if (!used.Contains(id) && !g.IsDisposed) g.Detach();
+    }
+
+    /// <summary>元ウィンドウのうち、この片に映す範囲（サムネイルの座標 = ウィンドウ矩形の左上基準）。</summary>
+    private RectI SourceRect(GhostWindow g, GhostPiece p)
+    {
+        var (sw, sh) = g.SourceSize;
+        if (sw <= 0 || sh <= 0) (sw, sh) = (_startWindowRect.Width, _startWindowRect.Height);
+        // 見た目の部分（影などの見えない余白を除く）
+        double vl = _margins.Left, vt = _margins.Top;
+        double vw = Math.Max(1, sw - _margins.Left - _margins.Right), vh = Math.Max(1, sh - _margins.Top - _margins.Bottom);
+        return new RectI(
+            (int)Math.Round(vl + p.SrcLeft * vw), (int)Math.Round(vt + p.SrcTop * vh),
+            (int)Math.Round(vl + p.SrcRight * vw), (int)Math.Round(vt + p.SrcBottom * vh));
+    }
+
+    private void HideGhosts()
+    {
+        foreach (var g in _ghosts.Values) if (!g.IsDisposed) g.Detach();
+    }
+
+    // ---------------- ドロップ ----------------
+
+    private void End(int x, int y)
+    {
+        if (_hwnd == IntPtr.Zero || _home is null) return;
+        Move(x, y);
+        if (_hwnd == IntPtr.Zero) return; // Esc で取り消された
+        var monitors = _monitors.Monitors;
+        var dest = SizingEngine.MonitorFromPoint(monitors, x, y) ?? _home;
+        var snap = DragGeometry.DetectSnap((x, y), dest, monitors);
+
+        if (!_ghostMode && snap == SnapZone.None)
+        {
+            Finish(); // 同じ見た目のモニター内での普通の移動。もう本物が正しい位置にいる。
+            return;
+        }
+
+        var hwnd = _hwnd;
+        var home = _home;
+        bool resizable = _resizable;
+        var target = snap == SnapZone.None
+            ? DragGeometry.FitInto(DragGeometry.RectOnCursorMonitor(_widthMm, _heightMm, dest, (x, y), _grabFx, _grabFy), dest.WorkArea)
+            : DragGeometry.SnapRect(snap, dest.WorkArea);
+        if (!_resizable && snap == SnapZone.None)
+        {
+            // サイズを変えられないウィンドウは、位置だけ合わせて大きさはアプリに任せる
+            target = DragGeometry.FitInto(RectI.FromXywh(target.Left, target.Top,
+                (int)Math.Round(_liveVisual.Width * dest.Dpi / (double)home.Dpi), (int)Math.Round(_liveVisual.Height * dest.Dpi / (double)home.Dpi)), dest.WorkArea);
+        }
+
+        // プレビューで最終位置を覆ってから、本物を 1 回で配置する（途中の大きさの変化はプレビューの下に隠れる）。
+        if (_ghostMode) ShowGhosts(DragGeometry.Pieces(target, dest, (x, y), monitors));
+        var pre = DragGeometry.PreCompensate(target, home.Dpi, dest.Dpi);
+        var preWindow = _margins.Expand(pre);
+        Win32.SetWindowPos(hwnd, IntPtr.Zero, preWindow.Left, preWindow.Top, preWindow.Width, preWindow.Height,
+            Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | Win32.SWP_ASYNCWINDOWPOS | (_resizable || snap != SnapZone.None ? 0 : Win32.SWP_NOSIZE));
+
+        string exe = Path.GetFileName(WindowInspector.GetExePath(GetPid(hwnd)) ?? "?").ToLowerInvariant();
+        bool wasGhost = _ghostMode;
+        Finish(keepGhosts: true);
+
+        // アプリが DPI の変更に合わせて大きさを変え終わるのを見届けてからプレビューを消す。
+        // 90ms 経ってもずれていれば直す。最終位置に収まった時点ですぐ消すので、待ち時間は最小限。
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        bool corrected = false, maximized = false;
+        var timer = new System.Windows.Forms.Timer { Interval = 15 };
+        timer.Tick += (_, _) =>
+        {
+            try
+            {
+                long ms = sw.ElapsedMilliseconds;
+                bool done;
+                if (snap == SnapZone.Maximize)
+                {
+                    if (!maximized && ms >= 30) { Win32.ShowWindow(hwnd, Win32.SW_MAXIMIZE); maximized = true; }
+                    done = maximized && ms >= 120;
+                }
+                else if (!resizable && snap == SnapZone.None) done = ms >= 90;
+                else
+                {
+                    var now = WindowInspector.GetVisualRect(hwnd);
+                    bool ok = Math.Abs(now.Width - target.Width) <= 2 && Math.Abs(now.Height - target.Height) <= 2
+                              && Math.Abs(now.Left - target.Left) <= 2 && Math.Abs(now.Top - target.Top) <= 2;
+                    if (!ok && !corrected && ms >= 90)
+                    {
+                        WindowMover.MoveTo(hwnd, target, animate: false, durationMs: 0);
+                        corrected = true;
+                    }
+                    done = (ok && ms >= 30) || ms >= 400;
+                }
+                if (!done) return;
+                timer.Stop();
+                timer.Dispose();
+                if (_hwnd == IntPtr.Zero) HideGhosts(); // 次のドラッグが始まっていなければ
+                var final = WindowInspector.GetVisualRect(hwnd);
+                Log.Info($"なめらか移動 {exe}: {home.FriendlyName}→{dest.FriendlyName} target={target} final={final} snap={snap} corrected={corrected} {ms}ms");
+                Moved?.Invoke(new CorrectionRecord(DateTime.Now, exe, home.FriendlyName, dest.FriendlyName, _startWindowRect, final, true,
+                    snap != SnapZone.None ? $"スナップ: {snap}" : wasGhost ? "なめらか移動（プレビューで運んで配置）" : "移動"));
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                timer.Dispose();
+                HideGhosts();
+                Log.Error("ドロップ後の処理に失敗", ex);
+            }
+        };
+        timer.Start();
+    }
+
+    private static uint GetPid(IntPtr hwnd) { Win32.GetWindowThreadProcessId(hwnd, out uint pid); return pid; }
+
+    private void Cancel()
+    {
+        // 元の位置・大きさに戻す
+        var r = _startWindowRect;
+        Win32.SetWindowPos(_hwnd, IntPtr.Zero, r.Left, r.Top, r.Width, r.Height, Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE);
+        _hook.Reset();
+        Finish();
+    }
+
+    private void Abort()
+    {
+        _hook.Reset();
+        Finish();
+    }
+
+    private void Finish(bool keepGhosts = false)
+    {
+        if (!keepGhosts) HideGhosts();
+        _hwnd = IntPtr.Zero;
+        _home = null;
+        _ghostMode = false;
+    }
+
+    public void Dispose()
+    {
+        _monitors.Changed -= UpdateActive;
+        _hook.Dispose();
+        foreach (var g in _ghosts.Values) g.Dispose();
+    }
+}
